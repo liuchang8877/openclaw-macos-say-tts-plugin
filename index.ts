@@ -3,19 +3,25 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import type { OpenClawPluginApi, OpenClawPluginHttpRouteHandler } from "openclaw/plugin-sdk/core";
 
 const execFileAsync = promisify(execFile);
 const AUDIO_PATH = "/v1/audio/speech";
 const HEALTH_PATH = "/plugins/macos-say-tts/health";
+const MEDIA_PREFIX = "/plugins/macos-say-tts/media/";
 const MAX_BODY_BYTES = 128 * 1024;
+const DEFAULT_MEDIA_BASE_URL = "http://127.0.0.1:18789";
+const DEFAULT_MEDIA_TTL_SECONDS = 900;
 
 type PluginConfig = {
   defaultVoice?: string;
   defaultRate?: number;
   sampleRate?: number;
   maxInputChars?: number;
+  commandMediaBaseUrl?: string;
+  mediaTtlSeconds?: number;
 };
 
 type SpeechRequest = {
@@ -23,6 +29,14 @@ type SpeechRequest = {
   voice?: unknown;
   response_format?: unknown;
   speed?: unknown;
+};
+
+type StoredMedia = {
+  buffer: Buffer;
+  contentType: string;
+  fileName: string;
+  token: string;
+  expiresAt: number;
 };
 
 function parseRequestUrl(rawUrl?: string): URL | null {
@@ -119,8 +133,76 @@ async function synthesizeWithSay(params: {
   }
 }
 
-function createSpeechHandler(api: OpenClawPluginApi): OpenClawPluginHttpRouteHandler {
-  const config = (api.pluginConfig ?? {}) as PluginConfig;
+function buildMediaUrl(baseUrl: string, id: string, token: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}${MEDIA_PREFIX}${id}/${token}.wav`;
+}
+
+function normalizeMediaBaseUrl(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) {
+    return DEFAULT_MEDIA_BASE_URL;
+  }
+  return value.trim().replace(/\/+$/, "");
+}
+
+function buildPluginState(config: PluginConfig) {
+  const media = new Map<string, StoredMedia>();
+  const mediaBaseUrl = normalizeMediaBaseUrl(config.commandMediaBaseUrl);
+  const mediaTtlSeconds =
+    typeof config.mediaTtlSeconds === "number" && Number.isFinite(config.mediaTtlSeconds)
+      ? Math.max(60, Math.min(86400, Math.round(config.mediaTtlSeconds)))
+      : DEFAULT_MEDIA_TTL_SECONDS;
+
+  function pruneExpiredMedia() {
+    const now = Date.now();
+    for (const [id, entry] of media) {
+      if (entry.expiresAt <= now) {
+        media.delete(id);
+      }
+    }
+  }
+
+  function storeMedia(buffer: Buffer, contentType: string, fileName: string): string {
+    pruneExpiredMedia();
+    const id = randomUUID();
+    const token = randomBytes(18).toString("hex");
+    media.set(id, {
+      buffer,
+      contentType,
+      fileName,
+      token,
+      expiresAt: Date.now() + mediaTtlSeconds * 1000,
+    });
+    return buildMediaUrl(mediaBaseUrl, id, token);
+  }
+
+  function resolveMedia(pathname: string): StoredMedia | null {
+    pruneExpiredMedia();
+    if (!pathname.startsWith(MEDIA_PREFIX)) {
+      return null;
+    }
+    const rest = pathname.slice(MEDIA_PREFIX.length);
+    const [id, tokenWithExt] = rest.split("/");
+    const token = tokenWithExt?.replace(/\.wav$/i, "");
+    if (!id || !token) {
+      return null;
+    }
+    const entry = media.get(id);
+    if (!entry || entry.token !== token || entry.expiresAt <= Date.now()) {
+      media.delete(id);
+      return null;
+    }
+    return entry;
+  }
+
+  return {
+    mediaBaseUrl,
+    storeMedia,
+    resolveMedia,
+    pruneExpiredMedia,
+  };
+}
+
+function createSpeechHandler(api: OpenClawPluginApi, config: PluginConfig): OpenClawPluginHttpRouteHandler {
   const defaultVoice = typeof config.defaultVoice === "string" && config.defaultVoice.trim()
     ? config.defaultVoice.trim()
     : "Tingting";
@@ -207,21 +289,136 @@ function createHealthHandler(api: OpenClawPluginApi): OpenClawPluginHttpRouteHan
   };
 }
 
+function createMediaHandler(
+  api: OpenClawPluginApi,
+  state: ReturnType<typeof buildPluginState>,
+): OpenClawPluginHttpRouteHandler {
+  return async (req, res) => {
+    const parsed = parseRequestUrl(req.url);
+    if (!parsed || !parsed.pathname.startsWith(MEDIA_PREFIX)) {
+      return false;
+    }
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.setHeader("allow", "GET, HEAD");
+      respondText(res, 405, "Method not allowed");
+      return true;
+    }
+    const entry = state.resolveMedia(parsed.pathname);
+    if (!entry) {
+      respondText(res, 404, "Media not found");
+      return true;
+    }
+    res.statusCode = 200;
+    res.setHeader("cache-control", "private, max-age=60");
+    res.setHeader("content-type", entry.contentType);
+    res.setHeader("content-length", String(entry.buffer.length));
+    res.setHeader("content-disposition", `inline; filename="${entry.fileName}"`);
+    res.setHeader("x-content-type-options", "nosniff");
+    if (req.method === "HEAD") {
+      res.end();
+    } else {
+      res.end(entry.buffer);
+    }
+    return true;
+  };
+}
+
+function createTtsCommand(params: {
+  api: OpenClawPluginApi;
+  config: PluginConfig;
+  state: ReturnType<typeof buildPluginState>;
+}) {
+  const defaultVoice = typeof params.config.defaultVoice === "string" && params.config.defaultVoice.trim()
+    ? params.config.defaultVoice.trim()
+    : "Tingting";
+  const defaultRate =
+    typeof params.config.defaultRate === "number" && Number.isFinite(params.config.defaultRate)
+      ? params.config.defaultRate
+      : 175;
+  const sampleRate =
+    typeof params.config.sampleRate === "number" && Number.isFinite(params.config.sampleRate)
+      ? params.config.sampleRate
+      : 22050;
+  const maxInputChars =
+    typeof params.config.maxInputChars === "number" && Number.isFinite(params.config.maxInputChars)
+      ? params.config.maxInputChars
+      : 1200;
+
+  return {
+    name: "tts",
+    nativeNames: { default: "tts" },
+    description: "Generate speech audio from text and reply with a WAV attachment.",
+    acceptsArgs: true,
+    handler: async (ctx: {
+      args?: string;
+      channel: string;
+    }) => {
+      const text = ctx.args?.trim() ?? "";
+      if (!text) {
+        return {
+          text: "Usage: /tts 你好，今天想说什么？",
+          isError: true,
+        };
+      }
+      if (text.length > maxInputChars) {
+        return {
+          text: `Text is too long. Max ${maxInputChars} characters.`,
+          isError: true,
+        };
+      }
+
+      try {
+        const audio = await synthesizeWithSay({
+          text,
+          voice: defaultVoice,
+          rate: defaultRate,
+          responseFormat: "wav",
+          sampleRate,
+        });
+        const mediaUrl = params.state.storeMedia(
+          audio,
+          "audio/wav",
+          `tts-${Date.now()}.wav`,
+        );
+        return {
+          text: `TTS ready${ctx.channel === "feishu" ? " as a WAV attachment" : ""}.`,
+          mediaUrl,
+        };
+      } catch (error) {
+        params.api.logger.error(`macos-say-tts command failed: ${String(error)}`);
+        return {
+          text: `TTS generation failed: ${String(error)}`,
+          isError: true,
+        };
+      }
+    },
+  };
+}
+
 const plugin = {
   id: "macos-say-tts",
   name: "macOS Say TTS",
   description: "Expose /v1/audio/speech using macOS say and afconvert.",
   register(api: OpenClawPluginApi) {
+    const config = (api.pluginConfig ?? {}) as PluginConfig;
+    const state = buildPluginState(config);
     api.registerHttpRoute({
       path: AUDIO_PATH,
       auth: "gateway",
-      handler: createSpeechHandler(api),
+      handler: createSpeechHandler(api, config),
     });
     api.registerHttpRoute({
       path: HEALTH_PATH,
       auth: "plugin",
       handler: createHealthHandler(api),
     });
+    api.registerHttpRoute({
+      path: MEDIA_PREFIX,
+      auth: "plugin",
+      match: "prefix",
+      handler: createMediaHandler(api, state),
+    });
+    api.registerCommand(createTtsCommand({ api, config, state }));
   },
 };
 

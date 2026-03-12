@@ -18,6 +18,14 @@
     "maxInputChars": {
       "label": "Max Input Chars",
       "help": "Reject requests whose input text exceeds this length."
+    },
+    "commandMediaBaseUrl": {
+      "label": "Command Media Base URL",
+      "help": "Base URL used to build temporary media links for /tts command replies."
+    },
+    "mediaTtlSeconds": {
+      "label": "Media TTL Seconds",
+      "help": "How long temporary command-generated audio files remain downloadable."
     }
   },
   "configSchema": {
@@ -44,6 +52,16 @@
         "minimum": 32,
         "maximum": 4000,
         "default": 1200
+      },
+      "commandMediaBaseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:18789"
+      },
+      "mediaTtlSeconds": {
+        "type": "number",
+        "minimum": 60,
+        "maximum": 86400,
+        "default": 900
       }
     }
   }
