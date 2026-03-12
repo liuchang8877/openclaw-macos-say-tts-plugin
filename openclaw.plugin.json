@@ -1,0 +1,50 @@
+{
+  "id": "macos-say-tts",
+  "name": "macOS Say TTS",
+  "description": "Expose an OpenAI-compatible /v1/audio/speech endpoint backed by macOS say.",
+  "uiHints": {
+    "defaultVoice": {
+      "label": "Default Voice",
+      "help": "macOS say voice name, for example Tingting."
+    },
+    "defaultRate": {
+      "label": "Default Rate",
+      "help": "Speech rate in words per minute when the request omits speed."
+    },
+    "sampleRate": {
+      "label": "WAV Sample Rate",
+      "help": "Output sample rate passed to afconvert when response_format is wav."
+    },
+    "maxInputChars": {
+      "label": "Max Input Chars",
+      "help": "Reject requests whose input text exceeds this length."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "defaultVoice": {
+        "type": "string",
+        "default": "Tingting"
+      },
+      "defaultRate": {
+        "type": "number",
+        "minimum": 80,
+        "maximum": 360,
+        "default": 175
+      },
+      "sampleRate": {
+        "type": "number",
+        "enum": [16000, 22050, 24000, 44100],
+        "default": 22050
+      },
+      "maxInputChars": {
+        "type": "number",
+        "minimum": 32,
+        "maximum": 4000,
+        "default": 1200
+      }
+    }
+  }
+}
