@@ -11,20 +11,56 @@ It also registers a `/tts` plugin command so IM channels such as Feishu can ask 
 - Accepts an OpenAI-compatible request body:
   - `input`
   - `voice`
-  - `response_format` (`wav` or `aiff`)
+  - `response_format` (`wav`, `aiff`, or `opus`)
   - `speed`
 - Uses `say` to synthesize AIFF
 - Uses `afconvert` to convert to WAV when requested
+- Uses `ffmpeg` to convert to Opus when requested (required for Feishu native audio playback)
 - Creates temporary tokenized media URLs for command replies
 
-## Requirements
+## Installation
 
-- macOS host
-- `say` available in `PATH`
-- `afconvert` available in `PATH`
-- OpenClaw with plugin support
+### 1. System dependencies
 
-## Suggested config
+The plugin runs on **macOS only** and relies on three system commands:
+
+| Command | Comes with | Purpose |
+|---|---|---|
+| `say` | macOS (built-in) | Text-to-speech synthesis |
+| `afconvert` | macOS (built-in) | AIFF → WAV conversion |
+| `ffmpeg` | Homebrew | AIFF → Opus conversion (for Feishu native audio) |
+
+Install `ffmpeg` (includes `libopus`):
+
+```bash
+brew install ffmpeg
+```
+
+Verify `libopus` encoder is available:
+
+```bash
+ffmpeg -encoders 2>/dev/null | grep opus
+# Expected output should include: libopus
+```
+
+### 2. Install the plugin into OpenClaw
+
+Copy or symlink this directory into your OpenClaw plugins folder, then restart the gateway:
+
+```bash
+# Option A: symlink (recommended for development)
+ln -s /path/to/openclaw-macos-say-tts-plugin ~/.openclaw/plugins/macos-say-tts
+
+# Option B: copy
+cp -r /path/to/openclaw-macos-say-tts-plugin ~/.openclaw/plugins/macos-say-tts
+
+# Restart the gateway to load the plugin
+openclaw restart
+```
+
+### 3. Configure
+
+Add the plugin config to your OpenClaw configuration (e.g. `~/.openclaw/config.json`):
 
 ```json
 {
@@ -63,7 +99,9 @@ Once the plugin is installed and enabled, you can invoke it from chat with:
 /tts 你好，这是一个飞书里直接触发的语音合成测试。
 ```
 
-The plugin will synthesize a WAV file, expose it on a temporary tokenized media route, and let the channel adapter upload it as an attachment reply.
+The plugin will synthesize audio, expose it on a temporary tokenized media route, and let the channel adapter upload it as an attachment reply.
+
+> **Auto Opus for Feishu**: When invoked from a Feishu channel, the `/tts` command automatically outputs Opus format so that Feishu can render a native inline audio player. Other channels receive WAV.
 
 ## Notes
 
@@ -72,3 +110,4 @@ The plugin will synthesize a WAV file, expose it on a temporary tokenized media 
 - Temporary command media is exposed at `GET /plugins/macos-say-tts/media/:id/:token.wav`.
 - `speed` is mapped to `say -r` by scaling the configured `defaultRate`.
 - `commandMediaBaseUrl` should point at a gateway URL the OpenClaw host itself can fetch, typically `http://127.0.0.1:18789` or your reverse-proxied gateway URL.
+- `response_format=opus` (or `ogg`) triggers `ffmpeg` transcoding to Opus. Useful for clients that require Opus, such as Feishu.

@@ -85,9 +85,11 @@ async function readJsonBody(req: IncomingMessage): Promise<SpeechRequest> {
   return JSON.parse(raw) as SpeechRequest;
 }
 
-function resolveResponseFormat(value: unknown): "wav" | "aiff" {
+function resolveResponseFormat(value: unknown): "wav" | "aiff" | "opus" {
   const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
-  return normalized === "aiff" ? "aiff" : "wav";
+  if (normalized === "aiff") return "aiff";
+  if (normalized === "opus" || normalized === "ogg") return "opus";
+  return "wav";
 }
 
 function resolveSpeechRate(defaultRate: number, speed: unknown): number {
@@ -102,12 +104,11 @@ async function synthesizeWithSay(params: {
   text: string;
   voice: string;
   rate: number;
-  responseFormat: "wav" | "aiff";
+  responseFormat: "wav" | "aiff" | "opus";
   sampleRate: number;
 }): Promise<Buffer> {
   const dir = await mkdtemp(path.join(tmpdir(), "openclaw-macos-say-tts-"));
   const aiffPath = path.join(dir, "speech.aiff");
-  const outPath = path.join(dir, params.responseFormat === "wav" ? "speech.wav" : "speech.aiff");
 
   try {
     await execFileAsync("say", ["-v", params.voice, "-r", String(params.rate), "-o", aiffPath, params.text], {
@@ -116,15 +117,29 @@ async function synthesizeWithSay(params: {
     });
 
     if (params.responseFormat === "wav") {
+      const wavPath = path.join(dir, "speech.wav");
       await execFileAsync(
         "afconvert",
-        ["-f", "WAVE", "-d", `LEI16@${params.sampleRate}`, aiffPath, outPath],
+        ["-f", "WAVE", "-d", `LEI16@${params.sampleRate}`, aiffPath, wavPath],
         {
           timeout: 60_000,
           maxBuffer: 8 * 1024 * 1024,
         },
       );
-      return await readFile(outPath);
+      return await readFile(wavPath);
+    }
+
+    if (params.responseFormat === "opus") {
+      const opusPath = path.join(dir, "speech.opus");
+      await execFileAsync(
+        "ffmpeg",
+        ["-y", "-i", aiffPath, "-c:a", "libopus", "-b:a", "64k", "-ar", "48000", "-ac", "1", opusPath],
+        {
+          timeout: 60_000,
+          maxBuffer: 8 * 1024 * 1024,
+        },
+      );
+      return await readFile(opusPath);
     }
 
     return await readFile(aiffPath);
@@ -133,8 +148,8 @@ async function synthesizeWithSay(params: {
   }
 }
 
-function buildMediaUrl(baseUrl: string, id: string, token: string): string {
-  return `${baseUrl.replace(/\/+$/, "")}${MEDIA_PREFIX}${id}/${token}.wav`;
+function buildMediaUrl(baseUrl: string, id: string, token: string, ext: string = "wav"): string {
+  return `${baseUrl.replace(/\/+$/, "")}${MEDIA_PREFIX}${id}/${token}.${ext}`;
 }
 
 function normalizeMediaBaseUrl(value: unknown): string {
@@ -172,7 +187,8 @@ function buildPluginState(config: PluginConfig) {
       token,
       expiresAt: Date.now() + mediaTtlSeconds * 1000,
     });
-    return buildMediaUrl(mediaBaseUrl, id, token);
+    const ext = path.extname(fileName).replace(/^\./, "") || "wav";
+    return buildMediaUrl(mediaBaseUrl, id, token, ext);
   }
 
   function resolveMedia(pathname: string): StoredMedia | null {
@@ -182,7 +198,7 @@ function buildPluginState(config: PluginConfig) {
     }
     const rest = pathname.slice(MEDIA_PREFIX.length);
     const [id, tokenWithExt] = rest.split("/");
-    const token = tokenWithExt?.replace(/\.wav$/i, "");
+    const token = tokenWithExt?.replace(/\.(wav|opus|ogg|aiff)$/i, "");
     if (!id || !token) {
       return null;
     }
@@ -257,7 +273,8 @@ function createSpeechHandler(api: OpenClawPluginApi, config: PluginConfig): Open
       res.statusCode = 200;
       res.setHeader("cache-control", "no-store, max-age=0");
       res.setHeader("content-length", String(audio.length));
-      res.setHeader("content-type", responseFormat === "wav" ? "audio/wav" : "audio/aiff");
+      const contentType = responseFormat === "wav" ? "audio/wav" : responseFormat === "opus" ? "audio/ogg; codecs=opus" : "audio/aiff";
+      res.setHeader("content-type", contentType);
       res.setHeader("x-content-type-options", "nosniff");
       res.end(audio);
       return true;
@@ -347,7 +364,7 @@ function createTtsCommand(params: {
   return {
     name: "tts",
     nativeNames: { default: "tts" },
-    description: "Generate speech audio from text and reply with a WAV attachment.",
+    description: "Generate speech audio from text (auto Opus for Feishu, WAV otherwise).",
     acceptsArgs: true,
     handler: async (ctx: {
       args?: string;
@@ -368,20 +385,24 @@ function createTtsCommand(params: {
       }
 
       try {
+        const isFeishu = ctx.channel === "feishu";
+        const responseFormat = isFeishu ? "opus" : "wav";
         const audio = await synthesizeWithSay({
           text,
           voice: defaultVoice,
           rate: defaultRate,
-          responseFormat: "wav",
+          responseFormat,
           sampleRate,
         });
+        const mimeType = isFeishu ? "audio/ogg; codecs=opus" : "audio/wav";
+        const ext = isFeishu ? "opus" : "wav";
         const mediaUrl = params.state.storeMedia(
           audio,
-          "audio/wav",
-          `tts-${Date.now()}.wav`,
+          mimeType,
+          `tts-${Date.now()}.${ext}`,
         );
         return {
-          text: `TTS ready${ctx.channel === "feishu" ? " as a WAV attachment" : ""}.`,
+          text: `TTS ready${isFeishu ? " (Opus audio)" : ""}.`,
           mediaUrl,
         };
       } catch (error) {
