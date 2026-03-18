@@ -18,6 +18,30 @@ It also registers a `/tts` plugin command so IM channels such as Feishu can ask 
 - Uses `ffmpeg` to convert to Opus when requested (required for Feishu native audio playback)
 - Creates temporary tokenized media URLs for command replies
 
+## API behavior
+
+`POST /v1/audio/speech` accepts an OpenAI-compatible JSON body with:
+
+- `input` required, must be a non-empty string
+- `voice` optional, defaults to the configured `defaultVoice`
+- `response_format` optional, supports `wav`, `aiff`, `opus`, and `ogg`
+- `speed` optional, scales the configured `defaultRate`
+
+Format behavior:
+
+- Omitting `response_format` defaults to `wav`
+- `ogg` is accepted as an alias of Opus and returns `audio/ogg; codecs=opus`
+- Unsupported values such as `mp3` are rejected with `400`
+
+Error behavior:
+
+- `400` for invalid JSON bodies
+- `400` for missing `input`
+- `400` for unsupported `response_format`
+- `400` for input longer than `maxInputChars`
+- `413` for request bodies larger than 128 KiB
+- `500` for synthesis or transcoding failures, with a generic `TTS generation failed.` message
+
 ## Installation
 
 ### 1. System dependencies
@@ -103,6 +127,12 @@ The plugin will synthesize audio, expose it on a temporary tokenized media route
 
 > **Auto Opus for Feishu**: When invoked from a Feishu channel, the `/tts` command automatically outputs Opus format so that Feishu can render a native inline audio player. Other channels receive WAV.
 
+Command behavior:
+
+- Empty `/tts` input returns a usage error
+- Text longer than `maxInputChars` is rejected before synthesis
+- Feishu channels receive Opus media links; other channels receive WAV media links
+
 ## Notes
 
 - The route uses `auth: "gateway"`, so it reuses OpenClaw gateway auth.
@@ -110,4 +140,4 @@ The plugin will synthesize audio, expose it on a temporary tokenized media route
 - Temporary command media is exposed at `GET /plugins/macos-say-tts/media/:id/:token.wav`.
 - `speed` is mapped to `say -r` by scaling the configured `defaultRate`.
 - `commandMediaBaseUrl` should point at a gateway URL the OpenClaw host itself can fetch, typically `http://127.0.0.1:18789` or your reverse-proxied gateway URL.
-- `response_format=opus` (or `ogg`) triggers `ffmpeg` transcoding to Opus. Useful for clients that require Opus, such as Feishu.
+- `response_format=opus` or `response_format=ogg` triggers `ffmpeg` transcoding to Opus. Useful for clients that require Opus, such as Feishu.

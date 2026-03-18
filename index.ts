@@ -39,6 +39,16 @@ type StoredMedia = {
   expiresAt: number;
 };
 
+class RequestValidationError extends Error {
+  statusCode: number;
+
+  constructor(statusCode: number, message: string) {
+    super(message);
+    this.name = "RequestValidationError";
+    this.statusCode = statusCode;
+  }
+}
+
 function parseRequestUrl(rawUrl?: string): URL | null {
   if (!rawUrl) {
     return null;
@@ -74,7 +84,7 @@ async function readJsonBody(req: IncomingMessage): Promise<SpeechRequest> {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += buf.length;
     if (total > MAX_BODY_BYTES) {
-      throw new Error("Request body too large");
+      throw new RequestValidationError(413, "Request body too large.");
     }
     chunks.push(buf);
   }
@@ -82,14 +92,26 @@ async function readJsonBody(req: IncomingMessage): Promise<SpeechRequest> {
   if (!raw) {
     return {};
   }
-  return JSON.parse(raw) as SpeechRequest;
+  try {
+    return JSON.parse(raw) as SpeechRequest;
+  } catch {
+    throw new RequestValidationError(400, "Invalid JSON body.");
+  }
 }
 
 function resolveResponseFormat(value: unknown): "wav" | "aiff" | "opus" {
-  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (value === undefined || value === null || value === "") {
+    return "wav";
+  }
+  if (typeof value !== "string") {
+    throw new RequestValidationError(400, "Invalid `response_format`. Use `wav`, `aiff`, or `opus`.");
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized === "wav") return "wav";
   if (normalized === "aiff") return "aiff";
   if (normalized === "opus" || normalized === "ogg") return "opus";
-  return "wav";
+  throw new RequestValidationError(400, "Unsupported `response_format`. Use `wav`, `aiff`, or `opus`.");
 }
 
 function resolveSpeechRate(defaultRate: number, speed: unknown): number {
@@ -279,8 +301,12 @@ function createSpeechHandler(api: OpenClawPluginApi, config: PluginConfig): Open
       res.end(audio);
       return true;
     } catch (error) {
+      if (error instanceof RequestValidationError) {
+        respondJson(res, error.statusCode, { error: { message: error.message } });
+        return true;
+      }
       api.logger.error(`macos-say-tts synth failed: ${String(error)}`);
-      respondJson(res, 500, { error: { message: String(error) } });
+      respondJson(res, 500, { error: { message: "TTS generation failed." } });
       return true;
     }
   };

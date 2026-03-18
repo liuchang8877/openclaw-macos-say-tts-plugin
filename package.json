@@ -4,6 +4,9 @@
   "private": true,
   "description": "External OpenClaw plugin that exposes /v1/audio/speech via macOS say",
   "type": "module",
+  "scripts": {
+    "test": "node --test ./index.test.mjs"
+  },
   "openclaw": {
     "extensions": [
       "./index.ts"
