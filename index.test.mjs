@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import plugin from "./index.ts";
 
-function createHarness(pluginConfig = { defaultVoice: "Tingting" }) {
+function createHarness(pluginConfig = { defaultVoice: "Tingting", transcriptionBackend: "openclaw-runtime" }) {
   const routes = [];
   const transcribeCalls = [];
   plugin.register({

@@ -21,7 +21,8 @@ It also registers a `/tts` plugin command so IM channels such as Feishu can ask 
 - Uses `afconvert` to convert to WAV when requested
 - Uses `ffmpeg` to convert to Opus when requested (required for Feishu native audio playback)
 - Creates temporary tokenized media URLs for command replies
-- Uses OpenClaw's configured media-understanding audio provider to transcribe uploaded audio
+- Uses local `whisper` CLI by default to transcribe uploaded audio on the Mac host
+- Can optionally fall back to OpenClaw runtime media-understanding if you set `transcriptionBackend: "openclaw-runtime"`
 
 ## API behavior
 
@@ -60,8 +61,9 @@ Accepts OpenAI-compatible `multipart/form-data`:
 Behavior:
 
 - The plugin writes the uploaded audio to a temp file
-- It calls `api.runtime.mediaUnderstanding.transcribeAudioFile(...)`
-- Provider selection and provider credentials stay inside OpenClaw config
+- By default, it runs local `whisper` on the Mac host:
+  - `whisper --model turbo --output_format txt --output_dir ...`
+- If you set `transcriptionBackend: "openclaw-runtime"`, it instead calls `api.runtime.mediaUnderstanding.transcribeAudioFile(...)`
 - `response_format=text` returns `text/plain`
 - `response_format=json` or `verbose_json` returns `{ "text": "..." }`
 
@@ -84,11 +86,13 @@ The plugin runs on **macOS only** and relies on three system commands:
 | `say` | macOS (built-in) | Text-to-speech synthesis |
 | `afconvert` | macOS (built-in) | AIFF → WAV conversion |
 | `ffmpeg` | Homebrew | AIFF → Opus conversion (for Feishu native audio) |
+| `whisper` | `pip install openai-whisper` | Local speech-to-text transcription |
 
-Install `ffmpeg` (includes `libopus`):
+Install dependencies:
 
 ```bash
 brew install ffmpeg
+python3 -m pip install --user -U openai-whisper
 ```
 
 Verify `libopus` encoder is available:
@@ -96,6 +100,13 @@ Verify `libopus` encoder is available:
 ```bash
 ffmpeg -encoders 2>/dev/null | grep opus
 # Expected output should include: libopus
+```
+
+Verify local whisper is available:
+
+```bash
+which whisper
+whisper --help
 ```
 
 ### 2. Install the plugin into OpenClaw
@@ -127,6 +138,10 @@ Add the plugin config to your OpenClaw configuration (e.g. `~/.openclaw/config.j
       "sampleRate": 22050,
       "maxInputChars": 1200,
       "maxAudioBytes": 8388608,
+      "transcriptionBackend": "local-whisper",
+      "transcriptionCommand": "whisper",
+      "transcriptionModel": "turbo",
+      "transcriptionTimeoutSeconds": 120,
       "commandMediaBaseUrl": "http://127.0.0.1:18789",
       "mediaTtlSeconds": 900
     }
@@ -173,7 +188,8 @@ Command behavior:
 - The route uses `auth: "gateway"`, so it reuses OpenClaw gateway auth.
 - Health check is exposed at `GET /plugins/macos-say-tts/health`.
 - Temporary command media is exposed at `GET /plugins/macos-say-tts/media/:id/:token.wav`.
-- Audio transcription uses whatever provider is configured in OpenClaw `tools.media.audio`.
+- Audio transcription uses local `whisper` by default on the Mac host.
+- If you prefer provider-based STT, set `transcriptionBackend` to `openclaw-runtime`.
 - `speed` is mapped to `say -r` by scaling the configured `defaultRate`.
 - `commandMediaBaseUrl` should point at a gateway URL the OpenClaw host itself can fetch, typically `http://127.0.0.1:18789` or your reverse-proxied gateway URL.
 - `response_format=opus` or `response_format=ogg` triggers `ffmpeg` transcoding to Opus. Useful for clients that require Opus, such as Feishu.

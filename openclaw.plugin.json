@@ -23,6 +23,22 @@
       "label": "Max Audio Bytes",
       "help": "Reject transcription uploads whose multipart body exceeds this size."
     },
+    "transcriptionBackend": {
+      "label": "Transcription Backend",
+      "help": "Use local whisper by default, or switch to OpenClaw runtime media-understanding."
+    },
+    "transcriptionCommand": {
+      "label": "Transcription Command",
+      "help": "CLI command used for local transcription, for example whisper."
+    },
+    "transcriptionModel": {
+      "label": "Transcription Model",
+      "help": "Model name passed to the local whisper CLI."
+    },
+    "transcriptionTimeoutSeconds": {
+      "label": "Transcription Timeout",
+      "help": "Timeout in seconds for local transcription runs."
+    },
     "commandMediaBaseUrl": {
       "label": "Command Media Base URL",
       "help": "Base URL used to build temporary media links for /tts command replies."
@@ -62,6 +78,25 @@
         "minimum": 262144,
         "maximum": 26214400,
         "default": 8388608
+      },
+      "transcriptionBackend": {
+        "type": "string",
+        "enum": ["local-whisper", "openclaw-runtime"],
+        "default": "local-whisper"
+      },
+      "transcriptionCommand": {
+        "type": "string",
+        "default": "whisper"
+      },
+      "transcriptionModel": {
+        "type": "string",
+        "default": "turbo"
+      },
+      "transcriptionTimeoutSeconds": {
+        "type": "number",
+        "minimum": 10,
+        "maximum": 600,
+        "default": 120
       },
       "commandMediaBaseUrl": {
         "type": "string",

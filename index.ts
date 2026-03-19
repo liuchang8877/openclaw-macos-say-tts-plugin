@@ -23,6 +23,10 @@ type PluginConfig = {
   sampleRate?: number;
   maxInputChars?: number;
   maxAudioBytes?: number;
+  transcriptionBackend?: "local-whisper" | "openclaw-runtime";
+  transcriptionCommand?: string;
+  transcriptionModel?: string;
+  transcriptionTimeoutSeconds?: number;
   commandMediaBaseUrl?: string;
   mediaTtlSeconds?: number;
 };
@@ -261,6 +265,78 @@ async function synthesizeWithSay(params: {
   }
 }
 
+async function transcribeWithWhisper(params: {
+  filePath: string;
+  command: string;
+  model: string;
+  timeoutSeconds: number;
+}): Promise<string> {
+  const outputDir = await mkdtemp(path.join(tmpdir(), "openclaw-macos-say-stt-out-"));
+  try {
+    await execFileAsync(
+      params.command,
+      [
+        "--model",
+        params.model,
+        "--output_format",
+        "txt",
+        "--output_dir",
+        outputDir,
+        "--verbose",
+        "False",
+        params.filePath,
+      ],
+      {
+        timeout: Math.max(10, params.timeoutSeconds) * 1000,
+        maxBuffer: 8 * 1024 * 1024,
+      },
+    );
+    const outputBase = path.basename(params.filePath, path.extname(params.filePath));
+    const transcriptPath = path.join(outputDir, `${outputBase}.txt`);
+    const text = (await readFile(transcriptPath, "utf8")).trim();
+    return text;
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+}
+
+async function transcribeAudio(params: {
+  api: OpenClawPluginApi;
+  config: PluginConfig;
+  filePath: string;
+  mime?: string;
+}): Promise<string> {
+  const backend = params.config.transcriptionBackend ?? "local-whisper";
+  if (backend === "openclaw-runtime") {
+    const result = await params.api.runtime.mediaUnderstanding.transcribeAudioFile({
+      filePath: params.filePath,
+      cfg: params.api.config,
+      mime: params.mime,
+    });
+    return result.text?.trim() ?? "";
+  }
+
+  const command =
+    typeof params.config.transcriptionCommand === "string" && params.config.transcriptionCommand.trim()
+      ? params.config.transcriptionCommand.trim()
+      : "whisper";
+  const model =
+    typeof params.config.transcriptionModel === "string" && params.config.transcriptionModel.trim()
+      ? params.config.transcriptionModel.trim()
+      : "turbo";
+  const timeoutSeconds =
+    typeof params.config.transcriptionTimeoutSeconds === "number" &&
+    Number.isFinite(params.config.transcriptionTimeoutSeconds)
+      ? Math.max(10, Math.round(params.config.transcriptionTimeoutSeconds))
+      : 120;
+  return await transcribeWithWhisper({
+    filePath: params.filePath,
+    command,
+    model,
+    timeoutSeconds,
+  });
+}
+
 function buildMediaUrl(baseUrl: string, id: string, token: string, ext: string = "wav"): string {
   return `${baseUrl.replace(/\/+$/, "")}${MEDIA_PREFIX}${id}/${token}.${ext}`;
 }
@@ -430,13 +506,12 @@ function createTranscriptionHandler(api: OpenClawPluginApi, config: PluginConfig
         const filePath = path.join(dir, `upload${ext}`);
         const bytes = Buffer.from(await upload.file.arrayBuffer());
         await writeFile(filePath, bytes);
-
-        const result = await api.runtime.mediaUnderstanding.transcribeAudioFile({
+        const text = await transcribeAudio({
+          api,
+          config,
           filePath,
-          cfg: api.config,
           mime: upload.mime,
         });
-        const text = result.text?.trim() ?? "";
 
         if (upload.responseFormat === "text") {
           respondText(res, 200, text);
