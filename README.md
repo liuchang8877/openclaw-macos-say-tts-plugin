@@ -1,14 +1,18 @@
 # openclaw-macos-say-tts-plugin
 
-External OpenClaw plugin that exposes `POST /v1/audio/speech` and backs it with macOS `say`.
+External OpenClaw plugin that exposes:
+
+- `POST /v1/audio/speech`
+- `POST /v1/audio/transcriptions`
 
 It also registers a `/tts` plugin command so IM channels such as Feishu can ask the gateway to synthesize speech and receive a WAV attachment in-chat.
 
 ## What it does
 
 - Registers a gateway-authenticated `POST /v1/audio/speech`
+- Registers a gateway-authenticated `POST /v1/audio/transcriptions`
 - Registers a `/tts` plugin command for IM channels
-- Accepts an OpenAI-compatible request body:
+- Accepts an OpenAI-compatible TTS request body:
   - `input`
   - `voice`
   - `response_format` (`wav`, `aiff`, or `opus`)
@@ -17,8 +21,11 @@ It also registers a `/tts` plugin command so IM channels such as Feishu can ask 
 - Uses `afconvert` to convert to WAV when requested
 - Uses `ffmpeg` to convert to Opus when requested (required for Feishu native audio playback)
 - Creates temporary tokenized media URLs for command replies
+- Uses OpenClaw's configured media-understanding audio provider to transcribe uploaded audio
 
 ## API behavior
+
+### `POST /v1/audio/speech`
 
 `POST /v1/audio/speech` accepts an OpenAI-compatible JSON body with:
 
@@ -41,6 +48,30 @@ Error behavior:
 - `400` for input longer than `maxInputChars`
 - `413` for request bodies larger than 128 KiB
 - `500` for synthesis or transcoding failures, with a generic `TTS generation failed.` message
+
+### `POST /v1/audio/transcriptions`
+
+Accepts OpenAI-compatible `multipart/form-data`:
+
+- `file` required
+- `model` optional and ignored by the plugin itself
+- `response_format` optional, supports `json`, `verbose_json`, and `text`
+
+Behavior:
+
+- The plugin writes the uploaded audio to a temp file
+- It calls `api.runtime.mediaUnderstanding.transcribeAudioFile(...)`
+- Provider selection and provider credentials stay inside OpenClaw config
+- `response_format=text` returns `text/plain`
+- `response_format=json` or `verbose_json` returns `{ "text": "..." }`
+
+Error behavior:
+
+- `400` for invalid multipart bodies
+- `400` for missing `file`
+- `400` for unsupported `response_format`
+- `413` for oversized uploads
+- `500` for provider/runtime transcription failures, with a generic `Audio transcription failed.` message
 
 ## Installation
 
@@ -95,6 +126,7 @@ Add the plugin config to your OpenClaw configuration (e.g. `~/.openclaw/config.j
       "defaultRate": 175,
       "sampleRate": 22050,
       "maxInputChars": 1200,
+      "maxAudioBytes": 8388608,
       "commandMediaBaseUrl": "http://127.0.0.1:18789",
       "mediaTtlSeconds": 900
     }
@@ -110,6 +142,9 @@ Point the Pi TTS client at the same public OpenClaw gateway:
 export ENABLE_TTS="true"
 export OPENCLAW_BASE_URL="https://your-gateway.example.com"
 export OPENCLAW_TOKEN="your-gateway-token"
+export TRANSCRIBE_BASE_URL="https://your-gateway.example.com"
+export TRANSCRIBE_API_TOKEN="your-gateway-token"
+export TRANSCRIBE_HTTP_PATH="/v1/audio/transcriptions"
 export TTS_BASE_URL="https://your-gateway.example.com"
 export TTS_API_TOKEN="your-gateway-token"
 export TTS_HTTP_PATH="/v1/audio/speech"
@@ -138,6 +173,7 @@ Command behavior:
 - The route uses `auth: "gateway"`, so it reuses OpenClaw gateway auth.
 - Health check is exposed at `GET /plugins/macos-say-tts/health`.
 - Temporary command media is exposed at `GET /plugins/macos-say-tts/media/:id/:token.wav`.
+- Audio transcription uses whatever provider is configured in OpenClaw `tools.media.audio`.
 - `speed` is mapped to `say -r` by scaling the configured `defaultRate`.
 - `commandMediaBaseUrl` should point at a gateway URL the OpenClaw host itself can fetch, typically `http://127.0.0.1:18789` or your reverse-proxied gateway URL.
 - `response_format=opus` or `response_format=ogg` triggers `ffmpeg` transcoding to Opus. Useful for clients that require Opus, such as Feishu.

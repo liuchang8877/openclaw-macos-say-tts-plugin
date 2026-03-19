@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -9,9 +9,11 @@ import type { OpenClawPluginApi, OpenClawPluginHttpRouteHandler } from "openclaw
 
 const execFileAsync = promisify(execFile);
 const AUDIO_PATH = "/v1/audio/speech";
+const TRANSCRIPTIONS_PATH = "/v1/audio/transcriptions";
 const HEALTH_PATH = "/plugins/macos-say-tts/health";
 const MEDIA_PREFIX = "/plugins/macos-say-tts/media/";
 const MAX_BODY_BYTES = 128 * 1024;
+const DEFAULT_MAX_AUDIO_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MEDIA_BASE_URL = "http://127.0.0.1:18789";
 const DEFAULT_MEDIA_TTL_SECONDS = 900;
 
@@ -20,6 +22,7 @@ type PluginConfig = {
   defaultRate?: number;
   sampleRate?: number;
   maxInputChars?: number;
+  maxAudioBytes?: number;
   commandMediaBaseUrl?: string;
   mediaTtlSeconds?: number;
 };
@@ -37,6 +40,12 @@ type StoredMedia = {
   fileName: string;
   token: string;
   expiresAt: number;
+};
+
+type TranscriptionRequest = {
+  file: File;
+  mime?: string;
+  responseFormat: "json" | "text";
 };
 
 class RequestValidationError extends Error {
@@ -78,24 +87,62 @@ function respondText(res: ServerResponse, status: number, body: string): void {
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<SpeechRequest> {
+  const raw = await readRequestBody(req, MAX_BODY_BYTES);
+  if (!raw.length) {
+    return {};
+  }
+  try {
+    return JSON.parse(raw.toString("utf-8").trim()) as SpeechRequest;
+  } catch {
+    throw new RequestValidationError(400, "Invalid JSON body.");
+  }
+}
+
+async function readRequestBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += buf.length;
-    if (total > MAX_BODY_BYTES) {
+    if (total > maxBytes) {
       throw new RequestValidationError(413, "Request body too large.");
     }
     chunks.push(buf);
   }
-  const raw = Buffer.concat(chunks).toString("utf-8").trim();
-  if (!raw) {
-    return {};
+  return Buffer.concat(chunks);
+}
+
+function buildRequestHeaders(req: IncomingMessage): Headers {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        headers.append(name, entry);
+      }
+      continue;
+    }
+    if (typeof value === "string") {
+      headers.set(name, value);
+    }
   }
+  return headers;
+}
+
+async function readMultipartForm(req: IncomingMessage, maxBytes: number): Promise<FormData> {
+  const contentType = req.headers["content-type"];
+  if (typeof contentType !== "string" || !contentType.toLowerCase().includes("multipart/form-data")) {
+    throw new RequestValidationError(400, "Expected multipart/form-data request body.");
+  }
+  const body = await readRequestBody(req, maxBytes);
   try {
-    return JSON.parse(raw) as SpeechRequest;
+    const request = new Request("http://127.0.0.1/upload", {
+      method: req.method ?? "POST",
+      headers: buildRequestHeaders(req),
+      body,
+    });
+    return await request.formData();
   } catch {
-    throw new RequestValidationError(400, "Invalid JSON body.");
+    throw new RequestValidationError(400, "Invalid multipart/form-data body.");
   }
 }
 
@@ -120,6 +167,50 @@ function resolveSpeechRate(defaultRate: number, speed: unknown): number {
   }
   const normalizedSpeed = Math.min(4, Math.max(0.25, speed));
   return Math.round(defaultRate * normalizedSpeed);
+}
+
+function resolveTranscriptionResponseFormat(value: FormDataEntryValue | null): "json" | "text" {
+  if (typeof value !== "string" || !value.trim()) {
+    return "json";
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "json" || normalized === "verbose_json") return "json";
+  if (normalized === "text") return "text";
+  throw new RequestValidationError(
+    400,
+    "Unsupported `response_format`. Use `json`, `verbose_json`, or `text`.",
+  );
+}
+
+function inferMimeType(fileName: string): string | undefined {
+  const ext = path.extname(fileName).toLowerCase();
+  if (ext === ".wav") return "audio/wav";
+  if (ext === ".mp3") return "audio/mpeg";
+  if (ext === ".m4a") return "audio/mp4";
+  if (ext === ".ogg" || ext === ".opus") return "audio/ogg";
+  if (ext === ".webm") return "audio/webm";
+  if (ext === ".flac") return "audio/flac";
+  return undefined;
+}
+
+async function readTranscriptionRequest(req: IncomingMessage, maxAudioBytes: number): Promise<TranscriptionRequest> {
+  const form = await readMultipartForm(req, maxAudioBytes);
+  const uploaded = form.get("file");
+  if (!(uploaded instanceof File)) {
+    throw new RequestValidationError(400, "Missing `file` upload.");
+  }
+  if (uploaded.size <= 0) {
+    throw new RequestValidationError(400, "Uploaded audio file is empty.");
+  }
+
+  const responseFormat = resolveTranscriptionResponseFormat(form.get("response_format"));
+  const fileName = uploaded.name?.trim() || "audio.bin";
+  const mime = uploaded.type?.trim() || inferMimeType(fileName);
+  return {
+    file: uploaded,
+    mime,
+    responseFormat,
+  };
 }
 
 async function synthesizeWithSay(params: {
@@ -312,6 +403,62 @@ function createSpeechHandler(api: OpenClawPluginApi, config: PluginConfig): Open
   };
 }
 
+function createTranscriptionHandler(api: OpenClawPluginApi, config: PluginConfig): OpenClawPluginHttpRouteHandler {
+  const maxAudioBytes =
+    typeof config.maxAudioBytes === "number" && Number.isFinite(config.maxAudioBytes)
+      ? Math.max(256 * 1024, Math.round(config.maxAudioBytes))
+      : DEFAULT_MAX_AUDIO_BYTES;
+
+  return async (req, res) => {
+    const parsed = parseRequestUrl(req.url);
+    if (!parsed || parsed.pathname !== TRANSCRIPTIONS_PATH) {
+      return false;
+    }
+
+    if (req.method !== "POST") {
+      res.setHeader("allow", "POST");
+      respondText(res, 405, "Method not allowed");
+      return true;
+    }
+
+    try {
+      const upload = await readTranscriptionRequest(req, maxAudioBytes);
+      const dir = await mkdtemp(path.join(tmpdir(), "openclaw-macos-say-stt-"));
+      try {
+        const originalName = path.basename(upload.file.name?.trim() || "audio.bin");
+        const ext = path.extname(originalName) || ".bin";
+        const filePath = path.join(dir, `upload${ext}`);
+        const bytes = Buffer.from(await upload.file.arrayBuffer());
+        await writeFile(filePath, bytes);
+
+        const result = await api.runtime.mediaUnderstanding.transcribeAudioFile({
+          filePath,
+          cfg: api.config,
+          mime: upload.mime,
+        });
+        const text = result.text?.trim() ?? "";
+
+        if (upload.responseFormat === "text") {
+          respondText(res, 200, text);
+        } else {
+          respondJson(res, 200, { text });
+        }
+        return true;
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    } catch (error) {
+      if (error instanceof RequestValidationError) {
+        respondJson(res, error.statusCode, { error: { message: error.message } });
+        return true;
+      }
+      api.logger.error(`macos-say-tts transcribe failed: ${String(error)}`);
+      respondJson(res, 500, { error: { message: "Audio transcription failed." } });
+      return true;
+    }
+  };
+}
+
 function createHealthHandler(api: OpenClawPluginApi): OpenClawPluginHttpRouteHandler {
   return async (req, res) => {
     const parsed = parseRequestUrl(req.url);
@@ -326,6 +473,8 @@ function createHealthHandler(api: OpenClawPluginApi): OpenClawPluginHttpRouteHan
     respondJson(res, 200, {
       ok: true,
       plugin: api.id,
+      speechPath: AUDIO_PATH,
+      transcriptionPath: TRANSCRIPTIONS_PATH,
       voice: ((api.pluginConfig ?? {}) as PluginConfig).defaultVoice ?? "Tingting",
     });
     return true;
@@ -445,7 +594,7 @@ function createTtsCommand(params: {
 const plugin = {
   id: "macos-say-tts",
   name: "macOS Say TTS",
-  description: "Expose /v1/audio/speech using macOS say and afconvert.",
+  description: "Expose /v1/audio/speech and /v1/audio/transcriptions through OpenClaw.",
   register(api: OpenClawPluginApi) {
     const config = (api.pluginConfig ?? {}) as PluginConfig;
     const state = buildPluginState(config);
@@ -453,6 +602,11 @@ const plugin = {
       path: AUDIO_PATH,
       auth: "gateway",
       handler: createSpeechHandler(api, config),
+    });
+    api.registerHttpRoute({
+      path: TRANSCRIPTIONS_PATH,
+      auth: "gateway",
+      handler: createTranscriptionHandler(api, config),
     });
     api.registerHttpRoute({
       path: HEALTH_PATH,

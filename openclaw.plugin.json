@@ -1,7 +1,7 @@
 {
   "id": "macos-say-tts",
   "name": "macOS Say TTS",
-  "description": "Expose an OpenAI-compatible /v1/audio/speech endpoint backed by macOS say.",
+  "description": "Expose OpenAI-compatible /v1/audio/speech and /v1/audio/transcriptions endpoints through OpenClaw.",
   "uiHints": {
     "defaultVoice": {
       "label": "Default Voice",
@@ -18,6 +18,10 @@
     "maxInputChars": {
       "label": "Max Input Chars",
       "help": "Reject requests whose input text exceeds this length."
+    },
+    "maxAudioBytes": {
+      "label": "Max Audio Bytes",
+      "help": "Reject transcription uploads whose multipart body exceeds this size."
     },
     "commandMediaBaseUrl": {
       "label": "Command Media Base URL",
@@ -52,6 +56,12 @@
         "minimum": 32,
         "maximum": 4000,
         "default": 1200
+      },
+      "maxAudioBytes": {
+        "type": "number",
+        "minimum": 262144,
+        "maximum": 26214400,
+        "default": 8388608
       },
       "commandMediaBaseUrl": {
         "type": "string",
