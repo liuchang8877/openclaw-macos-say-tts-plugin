@@ -1,5 +1,5 @@
 {
-  "name": "@chang/openclaw-macos-say-tts",
+  "name": "@chang/macos-say-tts",
   "version": "0.1.0",
   "private": true,
   "description": "External OpenClaw plugin that exposes /v1/audio/speech via macOS say",
