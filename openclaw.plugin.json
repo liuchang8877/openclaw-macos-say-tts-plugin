@@ -35,6 +35,10 @@
       "label": "Transcription Model",
       "help": "Model name passed to the local whisper CLI."
     },
+    "transcriptionLanguage": {
+      "label": "Transcription Language",
+      "help": "Optional fixed language code for local whisper, for example zh or en."
+    },
     "transcriptionTimeoutSeconds": {
       "label": "Transcription Timeout",
       "help": "Timeout in seconds for local transcription runs."
@@ -91,6 +95,10 @@
       "transcriptionModel": {
         "type": "string",
         "default": "turbo"
+      },
+      "transcriptionLanguage": {
+        "type": "string",
+        "default": ""
       },
       "transcriptionTimeoutSeconds": {
         "type": "number",

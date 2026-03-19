@@ -56,6 +56,7 @@ Accepts OpenAI-compatible `multipart/form-data`:
 
 - `file` required
 - `model` optional and ignored by the plugin itself
+- `language` optional, forwarded to local whisper when provided
 - `response_format` optional, supports `json`, `verbose_json`, and `text`
 
 Behavior:
@@ -63,6 +64,7 @@ Behavior:
 - The plugin writes the uploaded audio to a temp file
 - By default, it runs local `whisper` on the Mac host:
   - `whisper --model turbo --output_format txt --output_dir ...`
+  - If `language` is present, it also appends `--language <code>` to skip auto detection
 - If you set `transcriptionBackend: "openclaw-runtime"`, it instead calls `api.runtime.mediaUnderstanding.transcribeAudioFile(...)`
 - `response_format=text` returns `text/plain`
 - `response_format=json` or `verbose_json` returns `{ "text": "..." }`
@@ -141,6 +143,7 @@ Add the plugin config to your OpenClaw configuration (e.g. `~/.openclaw/config.j
       "transcriptionBackend": "local-whisper",
       "transcriptionCommand": "whisper",
       "transcriptionModel": "turbo",
+      "transcriptionLanguage": "zh",
       "transcriptionTimeoutSeconds": 120,
       "commandMediaBaseUrl": "http://127.0.0.1:18789",
       "mediaTtlSeconds": 900
@@ -160,6 +163,7 @@ export OPENCLAW_TOKEN="your-gateway-token"
 export TRANSCRIBE_BASE_URL="https://your-gateway.example.com"
 export TRANSCRIBE_API_TOKEN="your-gateway-token"
 export TRANSCRIBE_HTTP_PATH="/v1/audio/transcriptions"
+export TRANSCRIBE_LANGUAGE="zh"
 export TTS_BASE_URL="https://your-gateway.example.com"
 export TTS_API_TOKEN="your-gateway-token"
 export TTS_HTTP_PATH="/v1/audio/speech"
