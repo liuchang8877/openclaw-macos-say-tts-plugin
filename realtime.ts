@@ -7,6 +7,8 @@ const DEFAULT_SESSION_TIMEOUT_SECONDS = 120;
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 15;
 const DEFAULT_MAX_AUDIO_SECONDS = 60;
 const DOUBAO_SUCCESS_CODE = 1000;
+const DOUBAO_BIGMODEL_WS_PATH = "/api/v3/sauc/bigmodel";
+const DOUBAO_BIGMODEL_MODEL_NAME = "bigmodel";
 
 const PROTOCOL_VERSION = 0x1;
 const HEADER_SIZE_UNITS = 0x1;
@@ -15,7 +17,10 @@ const MESSAGE_TYPE_AUDIO_ONLY_REQUEST = 0x2;
 const MESSAGE_TYPE_FULL_SERVER_RESPONSE = 0x9;
 const MESSAGE_TYPE_SERVER_ERROR_RESPONSE = 0xf;
 const MESSAGE_FLAG_NONE = 0x0;
+const MESSAGE_FLAG_HAS_SEQUENCE = 0x1;
+const MESSAGE_FLAG_POS_SEQUENCE = 0x1;
 const MESSAGE_FLAG_LAST_AUDIO = 0x2;
+const MESSAGE_FLAG_NEG_SEQUENCE = 0x3;
 const SERIALIZATION_NONE = 0x0;
 const SERIALIZATION_JSON = 0x1;
 const COMPRESSION_NONE = 0x0;
@@ -95,6 +100,10 @@ type DoubaoTransportDependencies = {
   WebSocket: WebSocketConstructor;
 };
 
+type DoubaoProtocolMode = "classic-v2" | "bigmodel-v3";
+
+type DoubaoWebSocketHeaders = Record<string, string>;
+
 type DoubaoUtterance = {
   definite?: boolean;
   text?: string;
@@ -137,8 +146,47 @@ function normalizeTrimmedString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function isDoubaoBigmodelWsUrl(value: string): boolean {
+  if (!value) {
+    return false;
+  }
+  try {
+    return new URL(value).pathname === DOUBAO_BIGMODEL_WS_PATH;
+  } catch {
+    return value.includes(DOUBAO_BIGMODEL_WS_PATH);
+  }
+}
+
+function resolveDoubaoProtocolMode(config: RealtimePluginConfig): DoubaoProtocolMode {
+  return isDoubaoBigmodelWsUrl(normalizeTrimmedString(config.doubaoWsUrl)) ? "bigmodel-v3" : "classic-v2";
+}
+
+function resolveDoubaoResourceId(config: RealtimePluginConfig): string {
+  return normalizeTrimmedString(config.doubaoResourceId);
+}
+
 function resolveDoubaoCluster(config: RealtimePluginConfig): string {
-  return normalizeTrimmedString(config.doubaoCluster) || normalizeTrimmedString(config.doubaoResourceId);
+  return normalizeTrimmedString(config.doubaoCluster) || resolveDoubaoResourceId(config);
+}
+
+function createDoubaoWebSocketHeaders(
+  config: RealtimePluginConfig,
+  sessionId: string,
+): DoubaoWebSocketHeaders {
+  const appId = normalizeTrimmedString(config.doubaoAppId);
+  const accessToken = normalizeTrimmedString(config.doubaoAccessToken);
+  if (resolveDoubaoProtocolMode(config) === "bigmodel-v3") {
+    return {
+      "X-Api-App-Key": appId,
+      "X-Api-Access-Key": accessToken,
+      "X-Api-Resource-Id": resolveDoubaoResourceId(config),
+      "X-Api-Connect-Id": sessionId,
+      "X-Api-Request-Id": sessionId,
+    };
+  }
+  return {
+    Authorization: `Bearer; ${accessToken}`,
+  };
 }
 
 function decodeAudioBase64(audioBase64: string): Buffer {
@@ -157,11 +205,12 @@ export function isDoubaoRealtimeConfigured(config: RealtimePluginConfig): boolea
   if ((config.transcriptionBackend ?? "local-whisper") !== "doubao-realtime") {
     return false;
   }
+  const mode = resolveDoubaoProtocolMode(config);
   return Boolean(
     normalizeTrimmedString(config.doubaoAppId) &&
       normalizeTrimmedString(config.doubaoAccessToken) &&
       normalizeTrimmedString(config.doubaoWsUrl) &&
-      resolveDoubaoCluster(config),
+      (mode === "bigmodel-v3" ? resolveDoubaoResourceId(config) : resolveDoubaoCluster(config)),
   );
 }
 
@@ -210,14 +259,23 @@ function encodeDoubaoPacket(params: {
   serialization: number;
   compression: number;
   payload: Buffer;
+  sequence?: number;
 }): Buffer {
-  const header = Buffer.alloc(8);
+  const header = Buffer.alloc(4);
   header[0] = (PROTOCOL_VERSION << 4) | HEADER_SIZE_UNITS;
   header[1] = (params.messageType << 4) | params.flags;
   header[2] = (params.serialization << 4) | params.compression;
   header[3] = 0x00;
-  header.writeUInt32BE(params.payload.length, 4);
-  return Buffer.concat([header, params.payload]);
+  const chunks = [header];
+  if (typeof params.sequence === "number") {
+    const sequence = Buffer.alloc(4);
+    sequence.writeInt32BE(params.sequence, 0);
+    chunks.push(sequence);
+  }
+  const payloadSize = Buffer.alloc(4);
+  payloadSize.writeUInt32BE(params.payload.length, 0);
+  chunks.push(payloadSize, params.payload);
+  return Buffer.concat(chunks);
 }
 
 function maybeCompress(payload: Buffer, compression: number): Buffer {
@@ -243,58 +301,101 @@ export function createDoubaoFullRequestPacket(params: {
   enablePartial: boolean;
 }): Buffer {
   const capability = getRealtimeCapability(params.config);
-  const payload = Buffer.from(
-    JSON.stringify({
-      app: {
-        appid: normalizeTrimmedString(params.config.doubaoAppId),
-        token: normalizeTrimmedString(params.config.doubaoAccessToken),
-        cluster: capability.cluster,
-      },
-      user: {
-        uid: params.sessionId,
-        device: "openclaw-plugin",
-        platform: "node",
-        network: "wired",
-      },
-      audio: {
-        format: "raw",
-        codec: "raw",
-        rate: params.sampleRate,
-        bits: 16,
-        channel: params.channels,
-      },
-      request: {
-        reqid: params.sessionId,
-        sequence: 1,
-        nbest: 1,
-        workflow: "audio_in,resample,partition,vad,fe,decode,nlu_punctuate",
-        show_utterances: params.enablePartial,
-        result_type: params.enablePartial ? "single" : "full",
-        language: params.language || capability.language || undefined,
-        vad_signal: capability.enableVad,
-        start_silence_time: capability.vadStartSilenceMs,
-        vad_silence_time: capability.vadEndSilenceMs,
-      },
-    }),
-    "utf8",
-  );
+  const mode = resolveDoubaoProtocolMode(params.config);
+  const payloadBody =
+    mode === "bigmodel-v3"
+      ? {
+          user: {
+            uid: params.sessionId,
+          },
+          audio: {
+            format: "pcm",
+            sample_rate: params.sampleRate,
+            bits: 16,
+            channel: params.channels,
+            codec: "raw",
+          },
+          request: {
+            reqid: params.sessionId,
+            model_name: DOUBAO_BIGMODEL_MODEL_NAME,
+            show_utterances: params.enablePartial,
+            result_type: params.enablePartial ? "single" : "full",
+            language: params.language || capability.language || undefined,
+            enable_punc: true,
+            vad_signal: capability.enableVad,
+            start_silence_time: capability.vadStartSilenceMs,
+            vad_silence_time: capability.vadEndSilenceMs,
+          },
+        }
+      : {
+          app: {
+            appid: normalizeTrimmedString(params.config.doubaoAppId),
+            token: normalizeTrimmedString(params.config.doubaoAccessToken),
+            cluster: capability.cluster,
+          },
+          user: {
+            uid: params.sessionId,
+            device: "openclaw-plugin",
+            platform: "node",
+            network: "wired",
+          },
+          audio: {
+            format: "raw",
+            codec: "raw",
+            rate: params.sampleRate,
+            bits: 16,
+            channel: params.channels,
+          },
+          request: {
+            reqid: params.sessionId,
+            sequence: 1,
+            nbest: 1,
+            workflow: "audio_in,resample,partition,vad,fe,decode,nlu_punctuate",
+            show_utterances: params.enablePartial,
+            result_type: params.enablePartial ? "single" : "full",
+            language: params.language || capability.language || undefined,
+            vad_signal: capability.enableVad,
+            start_silence_time: capability.vadStartSilenceMs,
+            vad_silence_time: capability.vadEndSilenceMs,
+          },
+        };
+  const payload = Buffer.from(JSON.stringify(payloadBody), "utf8");
 
   return encodeDoubaoPacket({
     messageType: MESSAGE_TYPE_FULL_CLIENT_REQUEST,
-    flags: MESSAGE_FLAG_NONE,
+    flags: mode === "bigmodel-v3" ? MESSAGE_FLAG_POS_SEQUENCE : MESSAGE_FLAG_NONE,
     serialization: SERIALIZATION_JSON,
     compression: COMPRESSION_GZIP,
     payload: maybeCompress(payload, COMPRESSION_GZIP),
+    sequence: mode === "bigmodel-v3" ? 1 : undefined,
   });
 }
 
-export function createDoubaoAudioPacket(audioChunk: Buffer, isLast: boolean): Buffer {
+export function createDoubaoAudioPacket(
+  audioChunk: Buffer,
+  isLast: boolean,
+  options: {
+    protocolMode?: DoubaoProtocolMode;
+    sequence?: number;
+  } = {},
+): Buffer {
+  const protocolMode = options.protocolMode ?? "classic-v2";
+  const isBigmodelV3 = protocolMode === "bigmodel-v3";
+  const compression = COMPRESSION_GZIP;
+  const payload = maybeCompress(audioChunk, compression);
   return encodeDoubaoPacket({
     messageType: MESSAGE_TYPE_AUDIO_ONLY_REQUEST,
-    flags: isLast ? MESSAGE_FLAG_LAST_AUDIO : MESSAGE_FLAG_NONE,
+    flags: isBigmodelV3
+      ? isLast
+        ? MESSAGE_FLAG_NEG_SEQUENCE
+        : MESSAGE_FLAG_POS_SEQUENCE
+      : isLast
+        ? MESSAGE_FLAG_LAST_AUDIO
+        : MESSAGE_FLAG_NONE,
     serialization: SERIALIZATION_NONE,
-    compression: COMPRESSION_GZIP,
-    payload: maybeCompress(audioChunk, COMPRESSION_GZIP),
+    compression,
+    payload,
+    sequence: isBigmodelV3 ? options.sequence : undefined,
   });
 }
 
@@ -318,6 +419,7 @@ export function decodeDoubaoPacket(data: Buffer): {
   compression: number;
   payload: Buffer;
   errorCode?: number;
+  sequence?: number;
 } {
   if (data.length < 8) {
     throw new Error("Invalid upstream realtime packet: too short.");
@@ -332,6 +434,7 @@ export function decodeDoubaoPacket(data: Buffer): {
   const flags = data[1] & 0x0f;
   const serialization = data[2] >> 4;
   const compression = data[2] & 0x0f;
+  const hasSequence = (flags & MESSAGE_FLAG_HAS_SEQUENCE) === MESSAGE_FLAG_HAS_SEQUENCE;
 
   if (messageType === MESSAGE_TYPE_SERVER_ERROR_RESPONSE) {
     if (data.length < 12) {
@@ -350,14 +453,18 @@ export function decodeDoubaoPacket(data: Buffer): {
     };
   }
 
-  const payloadSize = data.readUInt32BE(4);
-  const payload = maybeDecompress(data.subarray(8, 8 + payloadSize), compression);
+  const sequence = hasSequence ? data.readInt32BE(4) : undefined;
+  const payloadSizeOffset = hasSequence ? 8 : 4;
+  const payloadOffset = hasSequence ? 12 : 8;
+  const payloadSize = data.readUInt32BE(payloadSizeOffset);
+  const payload = maybeDecompress(data.subarray(payloadOffset, payloadOffset + payloadSize), compression);
   return {
     messageType,
     flags,
     serialization,
     compression,
     payload,
+    sequence,
   };
 }
 
@@ -366,6 +473,7 @@ export function mapDoubaoResponseToRealtimeEvents(packet: {
   payload: Buffer;
   serialization: number;
   errorCode?: number;
+  sequence?: number;
 }): RealtimeTransportEvent[] {
   if (packet.messageType === MESSAGE_TYPE_SERVER_ERROR_RESPONSE) {
     return [
@@ -405,6 +513,7 @@ export function mapDoubaoResponseToRealtimeEvents(packet: {
   const result = payload.result?.[0];
   const utterance = result?.utterances?.[0];
   const events: RealtimeTransportEvent[] = [];
+  const sequence = typeof payload.sequence === "number" ? payload.sequence : packet.sequence ?? 0;
 
   if (utterance?.text) {
     if (utterance.definite) {
@@ -414,7 +523,7 @@ export function mapDoubaoResponseToRealtimeEvents(packet: {
     }
   }
 
-  if ((payload.sequence ?? 0) < 0) {
+  if (sequence < 0) {
     events.push({
       type: "completed",
       text: normalizeTrimmedString(result?.text),
@@ -427,22 +536,24 @@ export function mapDoubaoResponseToRealtimeEvents(packet: {
 class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
   private readonly socket: WebSocketLike;
   private readonly openPromise: Promise<void>;
+  private readonly protocolMode: DoubaoProtocolMode;
   private eventHandler: (event: RealtimeTransportEvent) => void = () => {};
   private closed = false;
   private terminalSeen = false;
+  private nextAudioSequence = 2;
 
   constructor(
     params: {
       wsUrl: string;
-      accessToken: string;
+      headers: DoubaoWebSocketHeaders;
       initialPacket: Buffer;
+      protocolMode: DoubaoProtocolMode;
     },
     WebSocketImpl: WebSocketConstructor,
   ) {
+    this.protocolMode = params.protocolMode;
     this.socket = new WebSocketImpl(params.wsUrl, {
-      headers: {
-        Authorization: `Bearer; ${params.accessToken}`,
-      },
+      headers: params.headers,
     });
     this.socket.binaryType = "arraybuffer";
     this.openPromise = new Promise<void>((resolve, reject) => {
@@ -477,6 +588,17 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
       });
       this.socket.addEventListener("close", (event) => {
         if (!this.closed && !this.terminalSeen) {
+          if (
+            this.protocolMode === "bigmodel-v3" &&
+            (event.code ?? 0) === 1000 &&
+            String(event.reason || "").includes("finish last sequence")
+          ) {
+            this.terminalSeen = true;
+            this.eventHandler({
+              type: "completed",
+            });
+            return;
+          }
           this.eventHandler({
             type: "error",
             code: `doubao_ws_close_${event.code ?? 0}`,
@@ -485,6 +607,10 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
         }
       });
     });
+    // The actual websocket handshake happens after session.start returns.
+    // Consume connection failures here so a failed upstream dial does not
+    // become an unhandled rejection and crash the whole sidecar process.
+    this.openPromise.catch(() => {});
   }
 
   setEventHandler(handler: (event: RealtimeTransportEvent) => void): void {
@@ -493,12 +619,22 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
 
   async appendAudioChunk(chunk: Buffer): Promise<void> {
     await this.openPromise;
-    this.socket.send(createDoubaoAudioPacket(chunk, false));
+    this.socket.send(
+      createDoubaoAudioPacket(chunk, false, {
+        protocolMode: this.protocolMode,
+        sequence: this.protocolMode === "bigmodel-v3" ? this.nextAudioSequence++ : undefined,
+      }),
+    );
   }
 
   async commit(): Promise<void> {
     await this.openPromise;
-    this.socket.send(createDoubaoAudioPacket(Buffer.alloc(0), true));
+    this.socket.send(
+      createDoubaoAudioPacket(Buffer.alloc(0), true, {
+        protocolMode: this.protocolMode,
+        sequence: this.protocolMode === "bigmodel-v3" ? -this.nextAudioSequence++ : undefined,
+      }),
+    );
   }
 
   async cancel(): Promise<void> {
@@ -510,7 +646,12 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
       return;
     }
     this.closed = true;
-    this.socket.close(1000, "closing");
+    try {
+      this.socket.close(1000, "closing");
+    } catch {
+      // Undici can throw if close() happens before the connection is established.
+      // At this point the caller is already tearing the transport down anyway.
+    }
   }
 }
 
@@ -536,8 +677,8 @@ export function createDoubaoRealtimeTransportFactory(
     throw new Error("Doubao realtime transport requested, but required configuration is incomplete.");
   }
 
-  const accessToken = normalizeTrimmedString(config.doubaoAccessToken);
   const wsUrl = capability.wsUrl;
+  const protocolMode = resolveDoubaoProtocolMode(config);
 
   return async (params) => {
     const initialPacket = createDoubaoFullRequestPacket({
@@ -551,8 +692,9 @@ export function createDoubaoRealtimeTransportFactory(
     return new DoubaoRealtimeTransportConnection(
       {
         wsUrl,
-        accessToken,
+        headers: createDoubaoWebSocketHeaders(config, params.sessionId),
         initialPacket,
+        protocolMode,
       },
       deps.WebSocket,
     );
@@ -582,6 +724,10 @@ export class RealtimeSession {
     this.params = params;
     this.transportFactory = transportFactory;
     this.id = id;
+    // Upstream failures can arrive before the caller awaits commit().
+    // Consume the deferred rejection here so it never becomes an
+    // unhandled rejection that terminates the sidecar process.
+    this.completion.promise.catch(() => {});
   }
 
   onEvent(listener: (event: RealtimeSessionEvent) => void): () => void {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { gzipSync } from "node:zlib";
 
 import {
+  RealtimeSession,
   RealtimeSessionManager,
   createDoubaoAudioPacket,
   createDoubaoFullRequestPacket,
@@ -236,6 +237,50 @@ test("full request packet encodes doubao session settings", () => {
   assert.equal(payload.request.vad_silence_time, 900);
 });
 
+test("bigmodel v3 request packet encodes official websocket payload fields", () => {
+  const packet = createDoubaoFullRequestPacket({
+    config: {
+      transcriptionBackend: "doubao-realtime",
+      doubaoAppId: "app-123",
+      doubaoAccessToken: "token-456",
+      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+      doubaoResourceId: "volc.bigasr.sauc.duration",
+      doubaoLanguage: "zh",
+      doubaoEnableVad: true,
+      doubaoVadStartSilenceMs: 700,
+      doubaoVadEndSilenceMs: 900,
+    },
+    sessionId: "session-v3",
+    language: "zh",
+    sampleRate: 16000,
+    channels: 1,
+    enablePartial: true,
+  });
+
+  const decoded = decodeDoubaoPacket(packet);
+  const payload = JSON.parse(decoded.payload.toString("utf8"));
+
+  assert.equal(decoded.messageType, 1);
+  assert.equal(payload.app, undefined);
+  assert.deepEqual(payload.user, { uid: "session-v3" });
+  assert.deepEqual(payload.audio, {
+    format: "pcm",
+    sample_rate: 16000,
+    bits: 16,
+    channel: 1,
+    codec: "raw",
+  });
+  assert.equal(payload.request.reqid, "session-v3");
+  assert.equal(payload.request.model_name, "bigmodel");
+  assert.equal(payload.request.show_utterances, true);
+  assert.equal(payload.request.result_type, "single");
+  assert.equal(payload.request.language, "zh");
+  assert.equal(payload.request.enable_punc, true);
+  assert.equal(payload.request.vad_signal, true);
+  assert.equal(payload.request.start_silence_time, 700);
+  assert.equal(payload.request.vad_silence_time, 900);
+});
+
 test("audio packets round-trip through binary codec", () => {
   const packet = createDoubaoAudioPacket(Buffer.from("pcm-bytes"), true);
   const decoded = decodeDoubaoPacket(packet);
@@ -265,6 +310,24 @@ test("server responses map to partial final and completed realtime events", () =
     { type: "partial", text: "你好，我想问" },
   ]);
   assert.deepEqual(mapDoubaoResponseToRealtimeEvents(finalPacket), [
+    { type: "final", text: "你好，我想问一下今天的天气。" },
+    { type: "completed", text: "你好，我想问一下今天的天气。" },
+  ]);
+});
+
+test("server responses with sequence header map to realtime events", () => {
+  const packet = decodeDoubaoPacket(
+    createDoubaoFullServerResponsePacket(
+      {
+        code: 1000,
+        result: [{ text: "你好，我想问一下今天的天气。", utterances: [{ text: "你好，我想问一下今天的天气。", definite: true }] }],
+      },
+      { sequence: -1 },
+    ),
+  );
+
+  assert.equal(packet.sequence, -1);
+  assert.deepEqual(mapDoubaoResponseToRealtimeEvents(packet), [
     { type: "final", text: "你好，我想问一下今天的天气。" },
     { type: "completed", text: "你好，我想问一下今天的天气。" },
   ]);
@@ -364,14 +427,248 @@ test("doubao realtime transport sends auth header and maps upstream websocket me
   ]);
 });
 
-function createDoubaoFullServerResponsePacket(payload) {
+test("bigmodel v3 transport sends official x-api headers", async () => {
+  class FakeWebSocket {
+    static instances = [];
+
+    constructor(url, options) {
+      this.url = url;
+      this.options = options;
+      this.binaryType = "blob";
+      this.listeners = { open: [], message: [], error: [], close: [] };
+      this.sent = [];
+      FakeWebSocket.instances.push(this);
+    }
+
+    addEventListener(type, listener) {
+      this.listeners[type].push(listener);
+    }
+
+    send(data) {
+      this.sent.push(data);
+    }
+
+    close() {}
+
+    emit(type, event = {}) {
+      for (const listener of this.listeners[type]) {
+        listener(event);
+      }
+    }
+  }
+
+  const factory = createDoubaoRealtimeTransportFactory(
+    {
+      transcriptionBackend: "doubao-realtime",
+      doubaoAppId: "9630954272",
+      doubaoAccessToken: "token-456",
+      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+      doubaoResourceId: "volc.bigasr.sauc.duration",
+    },
+    { WebSocket: FakeWebSocket },
+  );
+
+  const connection = await factory({
+    sessionId: "session-v3-auth",
+    sampleRate: 16000,
+    channels: 1,
+    enablePartial: true,
+  });
+
+  const instance = FakeWebSocket.instances[0];
+  const appendPromise = connection.appendAudioChunk(Buffer.from("abc"));
+  instance.emit("open");
+  await appendPromise;
+  await connection.commit();
+
+  assert.equal(instance.url, "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel");
+  assert.deepEqual(instance.options, {
+    headers: {
+      "X-Api-App-Key": "9630954272",
+      "X-Api-Access-Key": "token-456",
+      "X-Api-Resource-Id": "volc.bigasr.sauc.duration",
+      "X-Api-Connect-Id": "session-v3-auth",
+      "X-Api-Request-Id": "session-v3-auth",
+    },
+  });
+  assert.equal(instance.sent.length, 3);
+});
+
+test("bigmodel v3 close finish last sequence is treated as completed", async () => {
+  class FakeWebSocket {
+    static instances = [];
+
+    constructor(url, options) {
+      this.url = url;
+      this.options = options;
+      this.binaryType = "blob";
+      this.listeners = { open: [], message: [], error: [], close: [] };
+      this.sent = [];
+      FakeWebSocket.instances.push(this);
+    }
+
+    addEventListener(type, listener) {
+      this.listeners[type].push(listener);
+    }
+
+    send(data) {
+      this.sent.push(data);
+    }
+
+    close() {}
+
+    emit(type, event = {}) {
+      for (const listener of this.listeners[type]) {
+        listener(event);
+      }
+    }
+  }
+
+  const factory = createDoubaoRealtimeTransportFactory(
+    {
+      transcriptionBackend: "doubao-realtime",
+      doubaoAppId: "9630954272",
+      doubaoAccessToken: "token-456",
+      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+      doubaoResourceId: "volc.bigasr.sauc.duration",
+    },
+    { WebSocket: FakeWebSocket },
+  );
+
+  const connection = await factory({
+    sessionId: "session-v3-close",
+    sampleRate: 16000,
+    channels: 1,
+    enablePartial: true,
+  });
+
+  const events = [];
+  connection.setEventHandler((event) => {
+    events.push(event);
+  });
+
+  const instance = FakeWebSocket.instances[0];
+  const appendPromise = connection.appendAudioChunk(Buffer.from("abc"));
+  instance.emit("open");
+  await appendPromise;
+  await connection.commit();
+  instance.emit("close", { code: 1000, reason: "finish last sequence" });
+
+  assert.deepEqual(events, [{ type: "completed" }]);
+});
+
+test("doubao realtime transport does not leave an unhandled rejection when connect fails early", async () => {
+  class FakeWebSocket {
+    static instances = [];
+
+    constructor(url, options) {
+      this.url = url;
+      this.options = options;
+      this.binaryType = "blob";
+      this.listeners = { open: [], message: [], error: [], close: [] };
+      FakeWebSocket.instances.push(this);
+    }
+
+    addEventListener(type, listener) {
+      this.listeners[type].push(listener);
+    }
+
+    send() {}
+
+    close() {}
+
+    emit(type, event = {}) {
+      for (const listener of this.listeners[type]) {
+        listener(event);
+      }
+    }
+  }
+
+  const factory = createDoubaoRealtimeTransportFactory(
+    {
+      transcriptionBackend: "doubao-realtime",
+      doubaoAppId: "app-123",
+      doubaoAccessToken: "token-456",
+      doubaoWsUrl: "wss://example.invalid/asr",
+      doubaoCluster: "streaming-asr",
+    },
+    { WebSocket: FakeWebSocket },
+  );
+
+  const connection = await factory({
+    sessionId: "session-3",
+    sampleRate: 16000,
+    channels: 1,
+    enablePartial: true,
+  });
+
+  const instance = FakeWebSocket.instances[0];
+  let unhandledReason = null;
+  const onUnhandledRejection = (reason) => {
+    unhandledReason = reason;
+  };
+  process.once("unhandledRejection", onUnhandledRejection);
+
+  try {
+    instance.emit("error", { error: new Error("connect failed") });
+    await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(
+      connection.appendAudioChunk(Buffer.from("abc")),
+      /connect failed/,
+    );
+    assert.equal(unhandledReason, null);
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+  }
+});
+
+test("realtime session does not leave an unhandled rejection when upstream errors before commit", async () => {
+  const transport = createTransportHarness();
+  const session = new RealtimeSession(
+    {
+      audioFormat: "pcm_s16le",
+      sampleRate: 16000,
+      channels: 1,
+      enablePartial: true,
+    },
+    transport.factory,
+    "session-early-error",
+  );
+
+  let unhandledReason = null;
+  const onUnhandledRejection = (reason) => {
+    unhandledReason = reason;
+  };
+  process.once("unhandledRejection", onUnhandledRejection);
+
+  try {
+    await session.start();
+    transport.connections[0].emit({
+      type: "error",
+      code: "upstream_bootstrap_error",
+      message: "failed before commit",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(unhandledReason, null);
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+  }
+});
+
+function createDoubaoFullServerResponsePacket(payload, options = {}) {
   const body = Buffer.from(JSON.stringify(payload), "utf8");
-  const header = Buffer.alloc(8);
-  header[0] = 0x11;
-  header[1] = 0x90;
-  header[2] = 0x11;
-  header[3] = 0x00;
+  const hasSequence = typeof options.sequence === "number";
+  const header = Buffer.from([0x11, hasSequence ? 0x91 : 0x90, 0x11, 0x00]);
   const compressed = Buffer.from(gzipSync(body));
-  header.writeUInt32BE(compressed.length, 4);
-  return Buffer.concat([header, compressed]);
+  if (!hasSequence) {
+    const payloadSize = Buffer.alloc(4);
+    payloadSize.writeUInt32BE(compressed.length, 0);
+    return Buffer.concat([header, payloadSize, compressed]);
+  }
+
+  const sequence = Buffer.alloc(4);
+  sequence.writeInt32BE(options.sequence, 0);
+  const payloadSize = Buffer.alloc(4);
+  payloadSize.writeUInt32BE(compressed.length, 0);
+  return Buffer.concat([header, sequence, payloadSize, compressed]);
 }
