@@ -25,7 +25,7 @@
     },
     "transcriptionBackend": {
       "label": "Transcription Backend",
-      "help": "Use local whisper by default, OpenClaw runtime for one-shot transcription, or doubao-realtime for the new streaming ASR bridge."
+      "help": "Use local whisper by default, OpenClaw runtime for one-shot transcription, or doubao-realtime to proxy realtime STT to the sidecar bridge."
     },
     "transcriptionCommand": {
       "label": "Transcription Command",
@@ -43,57 +43,13 @@
       "label": "Transcription Timeout",
       "help": "Timeout in seconds for local transcription runs."
     },
-    "doubaoAppId": {
-      "label": "Doubao App ID",
-      "help": "Required for doubao-realtime. ByteDance/Volcengine application ID used for realtime ASR sessions."
+    "realtimeSidecarBaseUrl": {
+      "label": "Realtime Sidecar URL",
+      "help": "Required for doubao-realtime. Base URL of the external realtime bridge sidecar, for example http://127.0.0.1:8765."
     },
-    "doubaoAccessToken": {
-      "label": "Doubao Access Token",
-      "help": "Required for doubao-realtime. Token used to authenticate upstream realtime ASR sessions."
-    },
-    "doubaoWsUrl": {
-      "label": "Doubao WS URL",
-      "help": "Required for doubao-realtime. WebSocket URL for the upstream realtime ASR endpoint."
-    },
-    "doubaoResourceId": {
-      "label": "Doubao Resource ID",
-      "help": "Backward-compatible alias for the upstream realtime ASR cluster identifier."
-    },
-    "doubaoCluster": {
-      "label": "Doubao Cluster",
-      "help": "Required for doubao-realtime. Upstream ASR cluster identifier used in the realtime request payload."
-    },
-    "doubaoLanguage": {
-      "label": "Doubao Language",
-      "help": "Optional default language code for realtime ASR, for example zh."
-    },
-    "doubaoChunkMs": {
-      "label": "Doubao Chunk Size",
-      "help": "Chunk duration in milliseconds sent upstream for realtime ASR. 100 ms is the recommended starting point."
-    },
-    "doubaoEnableVad": {
-      "label": "Doubao VAD",
-      "help": "Enable upstream voice activity detection for realtime ASR."
-    },
-    "doubaoVadStartSilenceMs": {
-      "label": "Doubao VAD Start Silence",
-      "help": "How much leading silence to tolerate before speech start is considered missing."
-    },
-    "doubaoVadEndSilenceMs": {
-      "label": "Doubao VAD End Silence",
-      "help": "How much trailing silence to wait before upstream speech end is considered complete."
-    },
-    "realtimeSessionTimeoutSeconds": {
-      "label": "Realtime Session Timeout",
-      "help": "Maximum lifetime for a realtime STT session before forced cleanup."
-    },
-    "realtimeIdleTimeoutSeconds": {
-      "label": "Realtime Idle Timeout",
-      "help": "How long an inactive realtime STT session may stay idle before cleanup."
-    },
-    "realtimeMaxAudioSeconds": {
-      "label": "Realtime Max Audio",
-      "help": "Maximum audio duration accepted for one realtime session."
+    "realtimeSidecarAuthToken": {
+      "label": "Realtime Sidecar Token",
+      "help": "Optional bearer token used by the plugin when proxying requests to the realtime sidecar."
     },
     "commandMediaBaseUrl": {
       "label": "Command Media Base URL",
@@ -158,69 +114,13 @@
         "maximum": 600,
         "default": 120
       },
-      "doubaoAppId": {
+      "realtimeSidecarBaseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8765"
+      },
+      "realtimeSidecarAuthToken": {
         "type": "string",
         "default": ""
-      },
-      "doubaoAccessToken": {
-        "type": "string",
-        "default": ""
-      },
-      "doubaoWsUrl": {
-        "type": "string",
-        "default": ""
-      },
-      "doubaoResourceId": {
-        "type": "string",
-        "default": ""
-      },
-      "doubaoCluster": {
-        "type": "string",
-        "default": ""
-      },
-      "doubaoLanguage": {
-        "type": "string",
-        "default": "zh"
-      },
-      "doubaoChunkMs": {
-        "type": "number",
-        "minimum": 20,
-        "maximum": 1000,
-        "default": 100
-      },
-      "doubaoEnableVad": {
-        "type": "boolean",
-        "default": true
-      },
-      "doubaoVadStartSilenceMs": {
-        "type": "number",
-        "minimum": 100,
-        "maximum": 10000,
-        "default": 800
-      },
-      "doubaoVadEndSilenceMs": {
-        "type": "number",
-        "minimum": 100,
-        "maximum": 10000,
-        "default": 800
-      },
-      "realtimeSessionTimeoutSeconds": {
-        "type": "number",
-        "minimum": 10,
-        "maximum": 600,
-        "default": 120
-      },
-      "realtimeIdleTimeoutSeconds": {
-        "type": "number",
-        "minimum": 5,
-        "maximum": 120,
-        "default": 15
-      },
-      "realtimeMaxAudioSeconds": {
-        "type": "number",
-        "minimum": 5,
-        "maximum": 300,
-        "default": 60
       },
       "commandMediaBaseUrl": {
         "type": "string",

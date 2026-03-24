@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { gzipSync } from "node:zlib";
 import plugin from "./index.ts";
 
 function createHarness(pluginConfig = { defaultVoice: "Tingting", transcriptionBackend: "openclaw-runtime" }) {
@@ -198,10 +197,7 @@ test("health route reports realtime capability summary", async () => {
   const { invokeHealth } = createHarness({
     defaultVoice: "Tingting",
     transcriptionBackend: "doubao-realtime",
-    doubaoAppId: "app",
-    doubaoAccessToken: "token",
-    doubaoWsUrl: "wss://example.invalid/asr",
-    doubaoResourceId: "resource",
+    realtimeSidecarBaseUrl: "http://127.0.0.1:8765",
   });
 
   const response = await invokeHealth();
@@ -257,76 +253,42 @@ test("realtime route returns 409 when realtime backend is disabled", async () =>
   });
 });
 
-test("realtime route starts a session, forwards partials, and returns final text on commit", async () => {
-  class FakeWebSocket {
-    static instances = [];
-
-    constructor(url, options) {
-      this.url = url;
-      this.options = options;
-      this.binaryType = "blob";
-      this.listeners = { open: [], message: [], error: [], close: [] };
-      this.sent = [];
-      this.opened = false;
-      FakeWebSocket.instances.push(this);
-      queueMicrotask(() => {
-        this.opened = true;
-        this.emit("open");
-      });
-    }
-
-    addEventListener(type, listener) {
-      this.listeners[type].push(listener);
-    }
-
-    send(data) {
-      this.sent.push(data);
-      if (this.sent.length === 2) {
-        queueMicrotask(() => {
-          this.emit("message", {
-            data: createDoubaoFullServerResponsePacket({
-              code: 1000,
-              sequence: 1,
-              result: [{ text: "你好", utterances: [{ text: "你好，我想问", definite: false }] }],
-            }),
-          });
-        });
-      }
-      if (this.sent.length === 3) {
-        queueMicrotask(() => {
-          this.emit("message", {
-            data: createDoubaoFullServerResponsePacket({
-              code: 1000,
-              sequence: -1,
-              result: [{ text: "你好，我想问一下。", utterances: [{ text: "你好，我想问一下。", definite: true }] }],
-            }),
-          });
-        });
-      }
-    }
-
-    close(code, reason) {
-      this.closeCode = code;
-      this.closeReason = reason;
-    }
-
-    emit(type, event = {}) {
-      for (const listener of this.listeners[type]) {
-        listener(event);
-      }
-    }
-  }
-
-  const originalWebSocket = globalThis.WebSocket;
-  globalThis.WebSocket = FakeWebSocket;
+test("realtime route proxies request body to sidecar and relays response", async () => {
+  const originalFetch = globalThis.fetch;
   try {
+    const fetchCalls = [];
+    globalThis.fetch = async (url, options) => {
+      const rawBody = options.body;
+      const bodyBuffer = Buffer.isBuffer(rawBody)
+        ? rawBody
+        : Buffer.from(await rawBody.arrayBuffer());
+      fetchCalls.push({
+        url,
+        method: options.method,
+        authorization: options.headers.get("authorization"),
+        contentType: options.headers.get("content-type"),
+        body: JSON.parse(bodyBuffer.toString("utf8")),
+      });
+      return new Response(
+        JSON.stringify({
+          session_id: "session-123",
+          events: [{ type: "session.started", sessionId: "session-123" }],
+          chunk_ms: 100,
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+          },
+        },
+      );
+    };
+
     const { invokeRealtime } = createHarness({
       defaultVoice: "Tingting",
       transcriptionBackend: "doubao-realtime",
-      doubaoAppId: "app-123",
-      doubaoAccessToken: "token-456",
-      doubaoWsUrl: "wss://example.invalid/asr",
-      doubaoCluster: "streaming-asr",
+      realtimeSidecarBaseUrl: "http://127.0.0.1:8765",
+      realtimeSidecarAuthToken: "sidecar-token",
     });
 
     const started = await invokeRealtime({
@@ -340,46 +302,20 @@ test("realtime route starts a session, forwards partials, and returns final text
 
     assert.equal(started.statusCode, 200);
     assert.equal(started.json.chunk_ms, 100);
-    assert.equal(started.json.events.length, 1);
-    assert.equal(started.json.events[0].type, "session.started");
-    const sessionId = started.json.session_id;
-    assert.ok(sessionId);
-
-    const appended = await invokeRealtime({
-      type: "audio.append",
-      session_id: sessionId,
-      audio_base64: Buffer.from("abc").toString("base64"),
+    assert.equal(fetchCalls.length, 1);
+    assert.equal(fetchCalls[0].url, "http://127.0.0.1:8765/plugins/macos-say-tts/asr/realtime");
+    assert.equal(fetchCalls[0].method, "POST");
+    assert.equal(fetchCalls[0].authorization, "Bearer sidecar-token");
+    assert.equal(fetchCalls[0].contentType, "application/json");
+    assert.deepEqual(fetchCalls[0].body, {
+      type: "session.start",
+      audio_format: "pcm_s16le",
+      sample_rate: 16000,
+      channels: 1,
+      language: "zh",
+      enable_partial: true,
     });
-    assert.equal(appended.statusCode, 200);
-    assert.deepEqual(appended.json.events, [
-      { type: "transcript.partial", text: "你好，我想问" },
-    ]);
-
-    const committed = await invokeRealtime({
-      type: "session.commit",
-      session_id: sessionId,
-    });
-    assert.equal(committed.statusCode, 200);
-    assert.equal(committed.json.final_text, "你好，我想问一下。");
-    assert.deepEqual(committed.json.events, [
-      { type: "transcript.final", text: "你好，我想问一下。" },
-      { type: "session.completed", finalText: "你好，我想问一下。" },
-    ]);
-    assert.equal(FakeWebSocket.instances.length, 1);
-    assert.equal(FakeWebSocket.instances[0].binaryType, "arraybuffer");
   } finally {
-    globalThis.WebSocket = originalWebSocket;
+    globalThis.fetch = originalFetch;
   }
 });
-
-function createDoubaoFullServerResponsePacket(payload) {
-  const body = Buffer.from(JSON.stringify(payload), "utf8");
-  const compressed = Buffer.from(gzipSync(body));
-  const header = Buffer.alloc(8);
-  header[0] = 0x11;
-  header[1] = 0x90;
-  header[2] = 0x11;
-  header[3] = 0x00;
-  header.writeUInt32BE(compressed.length, 4);
-  return Buffer.concat([header, compressed]);
-}

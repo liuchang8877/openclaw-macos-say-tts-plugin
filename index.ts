@@ -7,11 +7,8 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import type { OpenClawPluginApi, OpenClawPluginHttpRouteHandler } from "openclaw/plugin-sdk/core";
 import {
-  createDoubaoRealtimeTransportFactory,
-  getRealtimeCapability,
   REALTIME_ASR_PATH,
-  type RealtimeSessionEvent,
-  RealtimeSessionManager,
+  getRealtimeCapability,
 } from "./realtime.ts";
 
 const execFileAsync = promisify(execFile);
@@ -50,6 +47,8 @@ type PluginConfig = {
   realtimeSessionTimeoutSeconds?: number;
   realtimeIdleTimeoutSeconds?: number;
   realtimeMaxAudioSeconds?: number;
+  realtimeSidecarBaseUrl?: string;
+  realtimeSidecarAuthToken?: string;
 };
 
 type SpeechRequest = {
@@ -84,15 +83,6 @@ type RealtimeActionRequest = {
   language?: unknown;
   enable_partial?: unknown;
 };
-
-type RealtimeSessionState = {
-  manager: RealtimeSessionManager | null;
-  events: Map<string, RealtimeSessionEvent[]>;
-};
-
-type SharedRealtimeStateStore = Map<string, RealtimeSessionState>;
-
-const SHARED_REALTIME_STATE_KEY = "__openclaw_macos_say_tts_realtime_state__";
 
 class RequestValidationError extends Error {
   statusCode: number;
@@ -324,55 +314,66 @@ function resolveRealtimeAudioFormat(value: unknown): "pcm_s16le" {
   return "pcm_s16le";
 }
 
-function ensureRealtimeSessionState(
-  config: PluginConfig,
-): RealtimeSessionState {
-  const store = getSharedRealtimeStateStore();
+function normalizeTrimmedString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function getRealtimeProxyConfig(config: PluginConfig) {
   const capability = getRealtimeCapability(config);
-  const configKey = JSON.stringify({
+  const sidecarBaseUrl = normalizeTrimmedString(config.realtimeSidecarBaseUrl).replace(/\/+$/, "");
+  const sidecarAuthToken = normalizeTrimmedString(config.realtimeSidecarAuthToken);
+  return {
+    enabled: capability.backend === "doubao-realtime",
+    configured: Boolean(sidecarBaseUrl),
     backend: capability.backend,
-    wsUrl: capability.wsUrl,
-    cluster: capability.cluster,
-    language: capability.language,
     chunkMs: capability.chunkMs,
-    appId: config.doubaoAppId ?? "",
+    sidecarBaseUrl,
+    sidecarAuthToken,
+  };
+}
+
+async function proxyRealtimeRequest(params: {
+  req: IncomingMessage;
+  config: PluginConfig;
+}): Promise<Response> {
+  const proxyConfig = getRealtimeProxyConfig(params.config);
+  if (!proxyConfig.sidecarBaseUrl) {
+    throw new RequestValidationError(
+      503,
+      "Realtime STT sidecar is not configured. Set `realtimeSidecarBaseUrl` in the plugin config.",
+    );
+  }
+
+  const body = await readRequestBody(params.req, DEFAULT_MAX_AUDIO_BYTES);
+  const headers = new Headers();
+  headers.set("content-type", "application/json");
+  if (proxyConfig.sidecarAuthToken) {
+    headers.set("authorization", `Bearer ${proxyConfig.sidecarAuthToken}`);
+  }
+
+  return await fetch(`${proxyConfig.sidecarBaseUrl}${REALTIME_ASR_PATH}`, {
+    method: "POST",
+    headers,
+    body,
   });
-  const existing = store.get(configKey);
-  if (existing) {
-    return existing;
+}
+
+async function relayFetchResponse(res: ServerResponse, upstream: Response): Promise<void> {
+  res.statusCode = upstream.status;
+  upstream.headers.forEach((value, name) => {
+    if (name.toLowerCase() === "transfer-encoding") {
+      return;
+    }
+    res.setHeader(name, value);
+  });
+  const body = Buffer.from(await upstream.arrayBuffer());
+  const hasContentLength = typeof res.getHeader === "function"
+    ? Boolean(res.getHeader("content-length"))
+    : false;
+  if (!hasContentLength) {
+    res.setHeader("content-length", String(body.length));
   }
-
-  const transportFactory = capability.enabled && capability.configured
-    ? createDoubaoRealtimeTransportFactory(config)
-    : null;
-  const state = {
-    manager: transportFactory ? new RealtimeSessionManager(config, transportFactory) : null,
-    events: new Map<string, RealtimeSessionEvent[]>(),
-  };
-  store.set(configKey, state);
-  return state;
-}
-
-function getSharedRealtimeStateStore(): SharedRealtimeStateStore {
-  const globalState = globalThis as typeof globalThis & {
-    [SHARED_REALTIME_STATE_KEY]?: SharedRealtimeStateStore;
-  };
-  if (!globalState[SHARED_REALTIME_STATE_KEY]) {
-    globalState[SHARED_REALTIME_STATE_KEY] = new Map<string, RealtimeSessionState>();
-  }
-  return globalState[SHARED_REALTIME_STATE_KEY]!;
-}
-
-function drainRealtimeEvents(state: RealtimeSessionState, sessionId: string): RealtimeSessionEvent[] {
-  const events = state.events.get(sessionId) ?? [];
-  state.events.set(sessionId, []);
-  return events;
-}
-
-function pushRealtimeEvent(state: RealtimeSessionState, sessionId: string, event: RealtimeSessionEvent): void {
-  const events = state.events.get(sessionId) ?? [];
-  events.push(event);
-  state.events.set(sessionId, events);
+  res.end(body);
 }
 
 function inferMimeType(fileName: string): string | undefined {
@@ -749,7 +750,7 @@ function createHealthHandler(api: OpenClawPluginApi): OpenClawPluginHttpRouteHan
       respondText(res, 405, "Method not allowed");
       return true;
     }
-    const capability = getRealtimeCapability((api.pluginConfig ?? {}) as PluginConfig);
+    const proxyConfig = getRealtimeProxyConfig((api.pluginConfig ?? {}) as PluginConfig);
     respondJson(res, 200, {
       ok: true,
       plugin: api.id,
@@ -757,9 +758,9 @@ function createHealthHandler(api: OpenClawPluginApi): OpenClawPluginHttpRouteHan
       transcriptionPath: TRANSCRIPTIONS_PATH,
       realtimePath: REALTIME_ASR_PATH,
       voice: ((api.pluginConfig ?? {}) as PluginConfig).defaultVoice ?? "Tingting",
-      realtimeEnabled: capability.enabled,
-      realtimeConfigured: capability.configured,
-      realtimeBackend: capability.backend,
+      realtimeEnabled: proxyConfig.enabled,
+      realtimeConfigured: proxyConfig.configured,
+      realtimeBackend: proxyConfig.backend,
     });
     return true;
   };
@@ -768,7 +769,6 @@ function createHealthHandler(api: OpenClawPluginApi): OpenClawPluginHttpRouteHan
 function createRealtimeAsrHandler(
   api: OpenClawPluginApi,
   config: PluginConfig,
-  state: RealtimeSessionState,
 ): OpenClawPluginHttpRouteHandler {
   return async (req, res) => {
     const parsed = parseRequestUrl(req.url);
@@ -783,8 +783,8 @@ function createRealtimeAsrHandler(
     }
 
     try {
-      const capability = getRealtimeCapability(config);
-      if (!capability.enabled) {
+      const proxyConfig = getRealtimeProxyConfig(config);
+      if (!proxyConfig.enabled) {
         respondJson(res, 409, {
           error: {
             message: "Realtime STT is disabled. Set `transcriptionBackend` to `doubao-realtime`.",
@@ -792,118 +792,33 @@ function createRealtimeAsrHandler(
         });
         return true;
       }
-      if (!capability.configured) {
-        respondJson(res, 503, {
-          error: {
-            message: "Realtime STT is not fully configured. Check Doubao websocket settings in the plugin config.",
-          },
-        });
-        return true;
-      }
-      if (!state.manager) {
-        respondJson(res, 503, {
-          error: {
-            message: "Realtime STT manager is unavailable. Check plugin startup logs and Doubao configuration.",
-          },
-        });
-        return true;
-      }
-      await state.manager.pruneExpiredSessions();
-
       const body = await readJsonBodyAny(req) as RealtimeActionRequest;
       const action = resolveRealtimeActionType(body.type);
-
       if (action === "session.start") {
-        const session = state.manager.createSession({
-          audioFormat: resolveRealtimeAudioFormat(body.audio_format),
-          sampleRate: resolveSampleRate(body.sample_rate),
-          channels: resolveChannels(body.channels),
-          language: resolveRealtimeLanguage(body.language),
-          enablePartial: resolveBoolean(body.enable_partial, true),
-        });
-        const startedAt = Date.now();
-        state.events.set(session.id, []);
-        session.onEvent((event) => {
-          if (event.type === "transcript.partial") {
-            const events = state.events.get(session.id) ?? [];
-            if (!events.some((item) => item.type === "transcript.partial")) {
-              api.logger.info(`macos-say-tts realtime first partial for ${session.id} after ${Date.now() - startedAt}ms`);
-            }
+        resolveRealtimeAudioFormat(body.audio_format);
+        resolveSampleRate(body.sample_rate);
+        resolveChannels(body.channels);
+        resolveRealtimeLanguage(body.language);
+        resolveBoolean(body.enable_partial, true);
+      } else {
+        resolveRealtimeSessionId(body.session_id);
+        if (action === "audio.append") {
+          if (typeof body.audio_base64 !== "string" || !body.audio_base64.trim()) {
+            throw new RequestValidationError(400, "Missing `audio_base64`.");
           }
-          pushRealtimeEvent(state, session.id, event);
-        });
-        await session.start();
-        api.logger.info(`macos-say-tts realtime session started ${session.id} sampleRate=${resolveSampleRate(body.sample_rate)} language=${resolveRealtimeLanguage(body.language) ?? "(auto)"}`);
-        respondJson(res, 200, {
-          session_id: session.id,
-          events: drainRealtimeEvents(state, session.id),
-          chunk_ms: capability.chunkMs,
-        });
-        return true;
-      }
-
-      const sessionId = resolveRealtimeSessionId(body.session_id);
-      const session = state.manager.getSession(sessionId);
-      if (!session) {
-        respondJson(res, 404, {
-          error: {
-            message: "Realtime session not found.",
-          },
-        });
-        return true;
-      }
-
-      if (action === "audio.append") {
-        if (typeof body.audio_base64 !== "string" || !body.audio_base64.trim()) {
-          throw new RequestValidationError(400, "Missing `audio_base64`.");
-        }
-        await session.appendAudioBase64(body.audio_base64);
-        respondJson(res, 200, {
-          session_id: session.id,
-          events: drainRealtimeEvents(state, session.id),
-        });
-        return true;
-      }
-
-      if (action === "session.commit") {
-        try {
-          const commitStartedAt = Date.now();
-          const finalText = await session.commit();
-          const events = drainRealtimeEvents(state, session.id);
-          await state.manager.closeSession(session.id);
-          state.events.delete(session.id);
-          api.logger.info(`macos-say-tts realtime session completed ${session.id} in ${Date.now() - commitStartedAt}ms finalChars=${finalText.length}`);
-          respondJson(res, 200, {
-            session_id: session.id,
-            final_text: finalText,
-            events,
-          });
-          return true;
-        } catch (error) {
-          const events = drainRealtimeEvents(state, session.id);
-          await state.manager.closeSession(session.id);
-          state.events.delete(session.id);
-          respondJson(res, 502, {
-            error: {
-              message: error instanceof Error ? error.message : String(error),
-            },
-            session_id: session.id,
-            events,
-          });
-          return true;
         }
       }
 
-      await session.cancel();
-      const events = drainRealtimeEvents(state, session.id);
-      await state.manager.closeSession(session.id);
-      state.events.delete(session.id);
-      api.logger.info(`macos-say-tts realtime session cancelled ${session.id}`);
-      respondJson(res, 200, {
-        session_id: session.id,
-        events,
-        cancelled: true,
-      });
+      const startedAt = Date.now();
+      const upstream = await proxyRealtimeRequest({ req, config });
+      if (action === "session.start") {
+        api.logger.info(`macos-say-tts realtime sidecar session.start responded in ${Date.now() - startedAt}ms`);
+      } else if (action === "audio.append") {
+        api.logger.info(`macos-say-tts realtime sidecar audio.append responded in ${Date.now() - startedAt}ms`);
+      } else if (action === "session.commit") {
+        api.logger.info(`macos-say-tts realtime sidecar session.commit responded in ${Date.now() - startedAt}ms`);
+      }
+      await relayFetchResponse(res, upstream);
       return true;
     } catch (error) {
       if (error instanceof RequestValidationError) {
@@ -1034,7 +949,6 @@ const plugin = {
   register(api: OpenClawPluginApi) {
     const config = (api.pluginConfig ?? {}) as PluginConfig;
     const state = buildPluginState(config);
-    const realtimeState = ensureRealtimeSessionState(config);
     api.registerHttpRoute({
       path: AUDIO_PATH,
       auth: "gateway",
@@ -1053,7 +967,7 @@ const plugin = {
     api.registerHttpRoute({
       path: REALTIME_ASR_PATH,
       auth: "gateway",
-      handler: createRealtimeAsrHandler(api, config, realtimeState),
+      handler: createRealtimeAsrHandler(api, config),
     });
     api.registerHttpRoute({
       path: MEDIA_PREFIX,
