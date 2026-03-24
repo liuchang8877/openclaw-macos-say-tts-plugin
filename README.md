@@ -4,6 +4,7 @@ External OpenClaw plugin that exposes:
 
 - `POST /v1/audio/speech`
 - `POST /v1/audio/transcriptions`
+- `POST /plugins/macos-say-tts/asr/realtime`
 
 It also registers a `/tts` plugin command so IM channels such as Feishu can ask the gateway to synthesize speech and receive a WAV attachment in-chat.
 
@@ -23,6 +24,7 @@ It also registers a `/tts` plugin command so IM channels such as Feishu can ask 
 - Creates temporary tokenized media URLs for command replies
 - Uses local `whisper` CLI by default to transcribe uploaded audio on the Mac host
 - Can optionally fall back to OpenClaw runtime media-understanding if you set `transcriptionBackend: "openclaw-runtime"`
+- Adds the first-stage config and session core for `doubao-realtime` streaming ASR bridging
 
 ## API behavior
 
@@ -145,12 +147,39 @@ Add the plugin config to your OpenClaw configuration (e.g. `~/.openclaw/config.j
       "transcriptionModel": "turbo",
       "transcriptionLanguage": "zh",
       "transcriptionTimeoutSeconds": 120,
+      "doubaoAppId": "",
+      "doubaoAccessToken": "",
+      "doubaoWsUrl": "",
+      "doubaoResourceId": "",
+      "doubaoCluster": "",
+      "doubaoLanguage": "zh",
+      "doubaoChunkMs": 100,
+      "doubaoEnableVad": true,
+      "doubaoVadStartSilenceMs": 800,
+      "doubaoVadEndSilenceMs": 800,
+      "realtimeSessionTimeoutSeconds": 120,
+      "realtimeIdleTimeoutSeconds": 15,
+      "realtimeMaxAudioSeconds": 60,
       "commandMediaBaseUrl": "http://127.0.0.1:18789",
       "mediaTtlSeconds": 900
     }
   }
 }
 ```
+
+### Realtime STT status
+
+This version adds the configuration surface and session-management core for a `doubao-realtime` backend.
+
+- The existing `POST /v1/audio/transcriptions` route remains available
+- When `transcriptionBackend` is `doubao-realtime`, the one-shot route falls back to OpenClaw runtime transcription for compatibility
+- The upstream Doubao WebSocket transport is now implemented in the plugin-side realtime core
+- `doubaoCluster` is the preferred field for the upstream cluster identifier; `doubaoResourceId` remains as a compatibility alias
+- The public realtime route is currently an HTTP action session API:
+  - `session.start`
+  - `audio.append`
+  - `session.commit`
+  - `session.cancel`
 
 ## Pi-side config
 
@@ -160,6 +189,14 @@ Point the Pi TTS client at the same public OpenClaw gateway:
 export ENABLE_TTS="true"
 export OPENCLAW_BASE_URL="https://your-gateway.example.com"
 export OPENCLAW_TOKEN="your-gateway-token"
+export STT_MODE="realtime"
+export REALTIME_STT_BASE_URL="https://your-gateway.example.com"
+export REALTIME_STT_API_TOKEN="your-gateway-token"
+export REALTIME_STT_HTTP_PATH="/plugins/macos-say-tts/asr/realtime"
+export REALTIME_STT_LANGUAGE="zh"
+export REALTIME_STT_CHUNK_MS="100"
+export REALTIME_STT_SHOW_PARTIAL="true"
+export REALTIME_STT_FALLBACK_TO_ONESHOT="true"
 export TRANSCRIBE_BASE_URL="https://your-gateway.example.com"
 export TRANSCRIBE_API_TOKEN="your-gateway-token"
 export TRANSCRIBE_HTTP_PATH="/v1/audio/transcriptions"
@@ -191,9 +228,11 @@ Command behavior:
 
 - The route uses `auth: "gateway"`, so it reuses OpenClaw gateway auth.
 - Health check is exposed at `GET /plugins/macos-say-tts/health`.
+- Realtime STT is exposed at `POST /plugins/macos-say-tts/asr/realtime`.
 - Temporary command media is exposed at `GET /plugins/macos-say-tts/media/:id/:token.wav`.
 - Audio transcription uses local `whisper` by default on the Mac host.
 - If you prefer provider-based STT, set `transcriptionBackend` to `openclaw-runtime`.
+- For realtime STT, set `transcriptionBackend` to `doubao-realtime` and configure Doubao websocket credentials.
 - `speed` is mapped to `say -r` by scaling the configured `defaultRate`.
 - `commandMediaBaseUrl` should point at a gateway URL the OpenClaw host itself can fetch, typically `http://127.0.0.1:18789` or your reverse-proxied gateway URL.
 - `response_format=opus` or `response_format=ogg` triggers `ffmpeg` transcoding to Opus. Useful for clients that require Opus, such as Feishu.

@@ -6,6 +6,13 @@ import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import type { OpenClawPluginApi, OpenClawPluginHttpRouteHandler } from "openclaw/plugin-sdk/core";
+import {
+  createDoubaoRealtimeTransportFactory,
+  getRealtimeCapability,
+  REALTIME_ASR_PATH,
+  type RealtimeSessionEvent,
+  RealtimeSessionManager,
+} from "./realtime.ts";
 
 const execFileAsync = promisify(execFile);
 const AUDIO_PATH = "/v1/audio/speech";
@@ -23,13 +30,26 @@ type PluginConfig = {
   sampleRate?: number;
   maxInputChars?: number;
   maxAudioBytes?: number;
-  transcriptionBackend?: "local-whisper" | "openclaw-runtime";
+  transcriptionBackend?: "local-whisper" | "openclaw-runtime" | "doubao-realtime";
   transcriptionCommand?: string;
   transcriptionModel?: string;
   transcriptionLanguage?: string;
   transcriptionTimeoutSeconds?: number;
   commandMediaBaseUrl?: string;
   mediaTtlSeconds?: number;
+  doubaoAppId?: string;
+  doubaoAccessToken?: string;
+  doubaoWsUrl?: string;
+  doubaoResourceId?: string;
+  doubaoCluster?: string;
+  doubaoLanguage?: string;
+  doubaoChunkMs?: number;
+  doubaoEnableVad?: boolean;
+  doubaoVadStartSilenceMs?: number;
+  doubaoVadEndSilenceMs?: number;
+  realtimeSessionTimeoutSeconds?: number;
+  realtimeIdleTimeoutSeconds?: number;
+  realtimeMaxAudioSeconds?: number;
 };
 
 type SpeechRequest = {
@@ -52,6 +72,22 @@ type TranscriptionRequest = {
   mime?: string;
   language?: string;
   responseFormat: "json" | "text";
+};
+
+type RealtimeActionRequest = {
+  type?: unknown;
+  session_id?: unknown;
+  audio_base64?: unknown;
+  audio_format?: unknown;
+  sample_rate?: unknown;
+  channels?: unknown;
+  language?: unknown;
+  enable_partial?: unknown;
+};
+
+type RealtimeSessionState = {
+  manager: RealtimeSessionManager | null;
+  events: Map<string, RealtimeSessionEvent[]>;
 };
 
 class RequestValidationError extends Error {
@@ -99,6 +135,18 @@ async function readJsonBody(req: IncomingMessage): Promise<SpeechRequest> {
   }
   try {
     return JSON.parse(raw.toString("utf-8").trim()) as SpeechRequest;
+  } catch {
+    throw new RequestValidationError(400, "Invalid JSON body.");
+  }
+}
+
+async function readJsonBodyAny(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRequestBody(req, DEFAULT_MAX_AUDIO_BYTES);
+  if (!raw.length) {
+    return {};
+  }
+  try {
+    return JSON.parse(raw.toString("utf-8").trim()) as Record<string, unknown>;
   } catch {
     throw new RequestValidationError(400, "Invalid JSON body.");
   }
@@ -194,6 +242,107 @@ function resolveOptionalFormString(value: FormDataEntryValue | null): string | u
   }
   const normalized = value.trim();
   return normalized || undefined;
+}
+
+function resolveRealtimeActionType(value: unknown): "session.start" | "audio.append" | "session.commit" | "session.cancel" {
+  if (typeof value !== "string") {
+    throw new RequestValidationError(
+      400,
+      "Missing or invalid `type`. Use `session.start`, `audio.append`, `session.commit`, or `session.cancel`.",
+    );
+  }
+  const normalized = value.trim();
+  if (
+    normalized === "session.start" ||
+    normalized === "audio.append" ||
+    normalized === "session.commit" ||
+    normalized === "session.cancel"
+  ) {
+    return normalized;
+  }
+  throw new RequestValidationError(
+    400,
+    "Unsupported `type`. Use `session.start`, `audio.append`, `session.commit`, or `session.cancel`.",
+  );
+}
+
+function resolveRealtimeSessionId(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new RequestValidationError(400, "Missing `session_id`.");
+  }
+  return value.trim();
+}
+
+function resolveRealtimeLanguage(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+
+function resolveBoolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  return fallback;
+}
+
+function resolveSampleRate(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new RequestValidationError(400, "Missing or invalid `sample_rate`.");
+  }
+  const rounded = Math.round(value);
+  if (rounded < 8000 || rounded > 48000) {
+    throw new RequestValidationError(400, "`sample_rate` must be between 8000 and 48000.");
+  }
+  return rounded;
+}
+
+function resolveChannels(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 1;
+  }
+  const rounded = Math.round(value);
+  if (rounded !== 1) {
+    throw new RequestValidationError(400, "Only mono audio (`channels=1`) is currently supported.");
+  }
+  return rounded;
+}
+
+function resolveRealtimeAudioFormat(value: unknown): "pcm_s16le" {
+  if (value === undefined || value === null || value === "") {
+    return "pcm_s16le";
+  }
+  if (typeof value !== "string" || value.trim() !== "pcm_s16le") {
+    throw new RequestValidationError(400, "Unsupported `audio_format`. Use `pcm_s16le`.");
+  }
+  return "pcm_s16le";
+}
+
+function ensureRealtimeSessionState(
+  config: PluginConfig,
+): RealtimeSessionState {
+  const capability = getRealtimeCapability(config);
+  const transportFactory = capability.enabled && capability.configured
+    ? createDoubaoRealtimeTransportFactory(config)
+    : null;
+  return {
+    manager: transportFactory ? new RealtimeSessionManager(config, transportFactory) : null,
+    events: new Map<string, RealtimeSessionEvent[]>(),
+  };
+}
+
+function drainRealtimeEvents(state: RealtimeSessionState, sessionId: string): RealtimeSessionEvent[] {
+  const events = state.events.get(sessionId) ?? [];
+  state.events.set(sessionId, []);
+  return events;
+}
+
+function pushRealtimeEvent(state: RealtimeSessionState, sessionId: string, event: RealtimeSessionEvent): void {
+  const events = state.events.get(sessionId) ?? [];
+  events.push(event);
+  state.events.set(sessionId, events);
 }
 
 function inferMimeType(fileName: string): string | undefined {
@@ -325,7 +474,7 @@ async function transcribeAudio(params: {
   language?: string;
 }): Promise<string> {
   const backend = params.config.transcriptionBackend ?? "local-whisper";
-  if (backend === "openclaw-runtime") {
+  if (backend === "openclaw-runtime" || backend === "doubao-realtime") {
     const result = await params.api.runtime.mediaUnderstanding.transcribeAudioFile({
       filePath: params.filePath,
       cfg: params.api.config,
@@ -570,14 +719,171 @@ function createHealthHandler(api: OpenClawPluginApi): OpenClawPluginHttpRouteHan
       respondText(res, 405, "Method not allowed");
       return true;
     }
+    const capability = getRealtimeCapability((api.pluginConfig ?? {}) as PluginConfig);
     respondJson(res, 200, {
       ok: true,
       plugin: api.id,
       speechPath: AUDIO_PATH,
       transcriptionPath: TRANSCRIPTIONS_PATH,
+      realtimePath: REALTIME_ASR_PATH,
       voice: ((api.pluginConfig ?? {}) as PluginConfig).defaultVoice ?? "Tingting",
+      realtimeEnabled: capability.enabled,
+      realtimeConfigured: capability.configured,
+      realtimeBackend: capability.backend,
     });
     return true;
+  };
+}
+
+function createRealtimeAsrHandler(
+  api: OpenClawPluginApi,
+  config: PluginConfig,
+  state: RealtimeSessionState,
+): OpenClawPluginHttpRouteHandler {
+  return async (req, res) => {
+    const parsed = parseRequestUrl(req.url);
+    if (!parsed || parsed.pathname !== REALTIME_ASR_PATH) {
+      return false;
+    }
+
+    if (req.method !== "POST") {
+      res.setHeader("allow", "POST");
+      respondText(res, 405, "Method not allowed");
+      return true;
+    }
+
+    try {
+      const capability = getRealtimeCapability(config);
+      if (!capability.enabled) {
+        respondJson(res, 409, {
+          error: {
+            message: "Realtime STT is disabled. Set `transcriptionBackend` to `doubao-realtime`.",
+          },
+        });
+        return true;
+      }
+      if (!capability.configured) {
+        respondJson(res, 503, {
+          error: {
+            message: "Realtime STT is not fully configured. Check Doubao websocket settings in the plugin config.",
+          },
+        });
+        return true;
+      }
+      if (!state.manager) {
+        respondJson(res, 503, {
+          error: {
+            message: "Realtime STT manager is unavailable. Check plugin startup logs and Doubao configuration.",
+          },
+        });
+        return true;
+      }
+      await state.manager.pruneExpiredSessions();
+
+      const body = await readJsonBodyAny(req) as RealtimeActionRequest;
+      const action = resolveRealtimeActionType(body.type);
+
+      if (action === "session.start") {
+        const session = state.manager.createSession({
+          audioFormat: resolveRealtimeAudioFormat(body.audio_format),
+          sampleRate: resolveSampleRate(body.sample_rate),
+          channels: resolveChannels(body.channels),
+          language: resolveRealtimeLanguage(body.language),
+          enablePartial: resolveBoolean(body.enable_partial, true),
+        });
+        const startedAt = Date.now();
+        state.events.set(session.id, []);
+        session.onEvent((event) => {
+          if (event.type === "transcript.partial") {
+            const events = state.events.get(session.id) ?? [];
+            if (!events.some((item) => item.type === "transcript.partial")) {
+              api.logger.info(`macos-say-tts realtime first partial for ${session.id} after ${Date.now() - startedAt}ms`);
+            }
+          }
+          pushRealtimeEvent(state, session.id, event);
+        });
+        await session.start();
+        api.logger.info(`macos-say-tts realtime session started ${session.id} sampleRate=${resolveSampleRate(body.sample_rate)} language=${resolveRealtimeLanguage(body.language) ?? "(auto)"}`);
+        respondJson(res, 200, {
+          session_id: session.id,
+          events: drainRealtimeEvents(state, session.id),
+          chunk_ms: capability.chunkMs,
+        });
+        return true;
+      }
+
+      const sessionId = resolveRealtimeSessionId(body.session_id);
+      const session = state.manager.getSession(sessionId);
+      if (!session) {
+        respondJson(res, 404, {
+          error: {
+            message: "Realtime session not found.",
+          },
+        });
+        return true;
+      }
+
+      if (action === "audio.append") {
+        if (typeof body.audio_base64 !== "string" || !body.audio_base64.trim()) {
+          throw new RequestValidationError(400, "Missing `audio_base64`.");
+        }
+        await session.appendAudioBase64(body.audio_base64);
+        respondJson(res, 200, {
+          session_id: session.id,
+          events: drainRealtimeEvents(state, session.id),
+        });
+        return true;
+      }
+
+      if (action === "session.commit") {
+        try {
+          const commitStartedAt = Date.now();
+          const finalText = await session.commit();
+          const events = drainRealtimeEvents(state, session.id);
+          await state.manager.closeSession(session.id);
+          state.events.delete(session.id);
+          api.logger.info(`macos-say-tts realtime session completed ${session.id} in ${Date.now() - commitStartedAt}ms finalChars=${finalText.length}`);
+          respondJson(res, 200, {
+            session_id: session.id,
+            final_text: finalText,
+            events,
+          });
+          return true;
+        } catch (error) {
+          const events = drainRealtimeEvents(state, session.id);
+          await state.manager.closeSession(session.id);
+          state.events.delete(session.id);
+          respondJson(res, 502, {
+            error: {
+              message: error instanceof Error ? error.message : String(error),
+            },
+            session_id: session.id,
+            events,
+          });
+          return true;
+        }
+      }
+
+      await session.cancel();
+      const events = drainRealtimeEvents(state, session.id);
+      await state.manager.closeSession(session.id);
+      state.events.delete(session.id);
+      api.logger.info(`macos-say-tts realtime session cancelled ${session.id}`);
+      respondJson(res, 200, {
+        session_id: session.id,
+        events,
+        cancelled: true,
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof RequestValidationError) {
+        respondJson(res, error.statusCode, { error: { message: error.message } });
+        return true;
+      }
+      api.logger.error(`macos-say-tts realtime route failed: ${String(error)}`);
+      respondJson(res, 500, { error: { message: "Realtime STT request failed." } });
+      return true;
+    }
   };
 }
 
@@ -698,6 +1004,7 @@ const plugin = {
   register(api: OpenClawPluginApi) {
     const config = (api.pluginConfig ?? {}) as PluginConfig;
     const state = buildPluginState(config);
+    const realtimeState = ensureRealtimeSessionState(config);
     api.registerHttpRoute({
       path: AUDIO_PATH,
       auth: "gateway",
@@ -712,6 +1019,11 @@ const plugin = {
       path: HEALTH_PATH,
       auth: "plugin",
       handler: createHealthHandler(api),
+    });
+    api.registerHttpRoute({
+      path: REALTIME_ASR_PATH,
+      auth: "gateway",
+      handler: createRealtimeAsrHandler(api, config, realtimeState),
     });
     api.registerHttpRoute({
       path: MEDIA_PREFIX,

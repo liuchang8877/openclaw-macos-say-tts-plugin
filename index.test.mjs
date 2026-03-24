@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { gzipSync } from "node:zlib";
 import plugin from "./index.ts";
 
 function createHarness(pluginConfig = { defaultVoice: "Tingting", transcriptionBackend: "openclaw-runtime" }) {
@@ -31,6 +32,10 @@ function createHarness(pluginConfig = { defaultVoice: "Tingting", transcriptionB
   assert.ok(speechRoute, "speech route should be registered");
   const transcriptionRoute = routes.find((route) => route.path === "/v1/audio/transcriptions");
   assert.ok(transcriptionRoute, "transcription route should be registered");
+  const healthRoute = routes.find((route) => route.path === "/plugins/macos-say-tts/health");
+  assert.ok(healthRoute, "health route should be registered");
+  const realtimeRoute = routes.find((route) => route.path === "/plugins/macos-say-tts/asr/realtime");
+  assert.ok(realtimeRoute, "realtime route should be registered");
 
   async function invokeRoute(route, params) {
     const req = {
@@ -91,7 +96,25 @@ function createHarness(pluginConfig = { defaultVoice: "Tingting", transcriptionB
     });
   }
 
-  return { invokeSpeech, invokeTranscription, transcribeCalls };
+  async function invokeHealth() {
+    return await invokeRoute(healthRoute, {
+      method: "GET",
+      url: "/plugins/macos-say-tts/health",
+    });
+  }
+
+  async function invokeRealtime(body) {
+    return await invokeRoute(realtimeRoute, {
+      method: "POST",
+      url: "/plugins/macos-say-tts/asr/realtime",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: Buffer.from(JSON.stringify(body)),
+    });
+  }
+
+  return { invokeSpeech, invokeTranscription, invokeHealth, invokeRealtime, transcribeCalls };
 }
 
 test("returns 400 for invalid JSON request bodies", async () => {
@@ -170,3 +193,193 @@ test("returns 400 for unsupported transcription response formats", async () => {
     error: { message: "Unsupported `response_format`. Use `json`, `verbose_json`, or `text`." },
   });
 });
+
+test("health route reports realtime capability summary", async () => {
+  const { invokeHealth } = createHarness({
+    defaultVoice: "Tingting",
+    transcriptionBackend: "doubao-realtime",
+    doubaoAppId: "app",
+    doubaoAccessToken: "token",
+    doubaoWsUrl: "wss://example.invalid/asr",
+    doubaoResourceId: "resource",
+  });
+
+  const response = await invokeHealth();
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.json, {
+    ok: true,
+    plugin: "macos-say-tts",
+    speechPath: "/v1/audio/speech",
+    transcriptionPath: "/v1/audio/transcriptions",
+    realtimePath: "/plugins/macos-say-tts/asr/realtime",
+    voice: "Tingting",
+    realtimeEnabled: true,
+    realtimeConfigured: true,
+    realtimeBackend: "doubao-realtime",
+  });
+});
+
+test("one-shot transcription falls back to runtime when doubao realtime backend is enabled", async () => {
+  const { invokeTranscription, transcribeCalls } = createHarness({
+    defaultVoice: "Tingting",
+    transcriptionBackend: "doubao-realtime",
+  });
+  const form = new FormData();
+  form.set("response_format", "json");
+  form.set("file", new File([Buffer.from("RIFFfake")], "utterance.wav", { type: "audio/wav" }));
+
+  const response = await invokeTranscription({ form });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.json, { text: "hello from openclaw" });
+  assert.equal(transcribeCalls.length, 1);
+});
+
+test("realtime route returns 409 when realtime backend is disabled", async () => {
+  const { invokeRealtime } = createHarness({
+    defaultVoice: "Tingting",
+    transcriptionBackend: "openclaw-runtime",
+  });
+
+  const response = await invokeRealtime({
+    type: "session.start",
+    audio_format: "pcm_s16le",
+    sample_rate: 16000,
+    channels: 1,
+  });
+
+  assert.equal(response.statusCode, 409);
+  assert.deepEqual(response.json, {
+    error: {
+      message: "Realtime STT is disabled. Set `transcriptionBackend` to `doubao-realtime`.",
+    },
+  });
+});
+
+test("realtime route starts a session, forwards partials, and returns final text on commit", async () => {
+  class FakeWebSocket {
+    static instances = [];
+
+    constructor(url, options) {
+      this.url = url;
+      this.options = options;
+      this.binaryType = "blob";
+      this.listeners = { open: [], message: [], error: [], close: [] };
+      this.sent = [];
+      this.opened = false;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        this.opened = true;
+        this.emit("open");
+      });
+    }
+
+    addEventListener(type, listener) {
+      this.listeners[type].push(listener);
+    }
+
+    send(data) {
+      this.sent.push(data);
+      if (this.sent.length === 2) {
+        queueMicrotask(() => {
+          this.emit("message", {
+            data: createDoubaoFullServerResponsePacket({
+              code: 1000,
+              sequence: 1,
+              result: [{ text: "你好", utterances: [{ text: "你好，我想问", definite: false }] }],
+            }),
+          });
+        });
+      }
+      if (this.sent.length === 3) {
+        queueMicrotask(() => {
+          this.emit("message", {
+            data: createDoubaoFullServerResponsePacket({
+              code: 1000,
+              sequence: -1,
+              result: [{ text: "你好，我想问一下。", utterances: [{ text: "你好，我想问一下。", definite: true }] }],
+            }),
+          });
+        });
+      }
+    }
+
+    close(code, reason) {
+      this.closeCode = code;
+      this.closeReason = reason;
+    }
+
+    emit(type, event = {}) {
+      for (const listener of this.listeners[type]) {
+        listener(event);
+      }
+    }
+  }
+
+  const originalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = FakeWebSocket;
+  try {
+    const { invokeRealtime } = createHarness({
+      defaultVoice: "Tingting",
+      transcriptionBackend: "doubao-realtime",
+      doubaoAppId: "app-123",
+      doubaoAccessToken: "token-456",
+      doubaoWsUrl: "wss://example.invalid/asr",
+      doubaoCluster: "streaming-asr",
+    });
+
+    const started = await invokeRealtime({
+      type: "session.start",
+      audio_format: "pcm_s16le",
+      sample_rate: 16000,
+      channels: 1,
+      language: "zh",
+      enable_partial: true,
+    });
+
+    assert.equal(started.statusCode, 200);
+    assert.equal(started.json.chunk_ms, 100);
+    assert.equal(started.json.events.length, 1);
+    assert.equal(started.json.events[0].type, "session.started");
+    const sessionId = started.json.session_id;
+    assert.ok(sessionId);
+
+    const appended = await invokeRealtime({
+      type: "audio.append",
+      session_id: sessionId,
+      audio_base64: Buffer.from("abc").toString("base64"),
+    });
+    assert.equal(appended.statusCode, 200);
+    assert.deepEqual(appended.json.events, [
+      { type: "transcript.partial", text: "你好，我想问" },
+    ]);
+
+    const committed = await invokeRealtime({
+      type: "session.commit",
+      session_id: sessionId,
+    });
+    assert.equal(committed.statusCode, 200);
+    assert.equal(committed.json.final_text, "你好，我想问一下。");
+    assert.deepEqual(committed.json.events, [
+      { type: "transcript.final", text: "你好，我想问一下。" },
+      { type: "session.completed", finalText: "你好，我想问一下。" },
+    ]);
+    assert.equal(FakeWebSocket.instances.length, 1);
+    assert.equal(FakeWebSocket.instances[0].binaryType, "arraybuffer");
+  } finally {
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+function createDoubaoFullServerResponsePacket(payload) {
+  const body = Buffer.from(JSON.stringify(payload), "utf8");
+  const compressed = Buffer.from(gzipSync(body));
+  const header = Buffer.alloc(8);
+  header[0] = 0x11;
+  header[1] = 0x90;
+  header[2] = 0x11;
+  header[3] = 0x00;
+  header.writeUInt32BE(compressed.length, 4);
+  return Buffer.concat([header, compressed]);
+}
