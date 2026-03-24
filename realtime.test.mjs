@@ -315,6 +315,40 @@ test("server responses map to partial final and completed realtime events", () =
   ]);
 });
 
+test("bigmodel v3 object-shaped responses map to realtime events", () => {
+  const partialPacket = decodeDoubaoPacket(
+    createDoubaoFullServerResponsePacket(
+      {
+        code: 1000,
+        result: {
+          text: "312",
+          utterances: [{ text: "312", definite: false }],
+        },
+      },
+      { sequence: 15 },
+    ),
+  );
+  const finalPacket = decodeDoubaoPacket(
+    createDoubaoFullServerResponsePacket(
+      {
+        code: 1000,
+        result: {
+          text: "3123123123123。",
+          utterances: [{ text: "3123123123123。", definite: true }],
+        },
+      },
+      { sequence: 57 },
+    ),
+  );
+
+  assert.deepEqual(mapDoubaoResponseToRealtimeEvents(partialPacket), [
+    { type: "partial", text: "312" },
+  ]);
+  assert.deepEqual(mapDoubaoResponseToRealtimeEvents(finalPacket), [
+    { type: "final", text: "3123123123123。" },
+  ]);
+});
+
 test("server responses with sequence header map to realtime events", () => {
   const packet = decodeDoubaoPacket(
     createDoubaoFullServerResponsePacket(
@@ -424,6 +458,163 @@ test("doubao realtime transport sends auth header and maps upstream websocket me
     { type: "partial", text: "你好，我想问" },
     { type: "final", text: "你好，我想问一下。" },
     { type: "completed", text: "你好，我想问一下。" },
+  ]);
+});
+
+test("doubao realtime transport observer receives send receive close diagnostics", async () => {
+  class FakeWebSocket {
+    static instances = [];
+
+    constructor(url, options) {
+      this.url = url;
+      this.options = options;
+      this.binaryType = "blob";
+      this.listeners = { open: [], message: [], error: [], close: [] };
+      this.sent = [];
+      FakeWebSocket.instances.push(this);
+    }
+
+    addEventListener(type, listener) {
+      this.listeners[type].push(listener);
+    }
+
+    send(data) {
+      this.sent.push(data);
+    }
+
+    close(code, reason) {
+      this.closeCode = code;
+      this.closeReason = reason;
+    }
+
+    emit(type, event = {}) {
+      for (const listener of this.listeners[type]) {
+        listener(event);
+      }
+    }
+  }
+
+  const observed = [];
+  const factory = createDoubaoRealtimeTransportFactory(
+    {
+      transcriptionBackend: "doubao-realtime",
+      doubaoAppId: "9630954272",
+      doubaoAccessToken: "token-456",
+      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+      doubaoResourceId: "volc.bigasr.sauc.duration",
+    },
+    {
+      WebSocket: FakeWebSocket,
+      observer: {
+        onOpen(event) {
+          observed.push({ type: "open", event });
+        },
+        onSend(event) {
+          observed.push({ type: "send", event });
+        },
+        onReceive(event) {
+          observed.push({
+            type: "receive",
+            event: {
+              sequence: event.packet.sequence,
+              payloadText: event.payloadText,
+              mappedEvents: event.mappedEvents,
+            },
+          });
+        },
+        onClose(event) {
+          observed.push({ type: "close", event });
+        },
+      },
+    },
+  );
+
+  const connection = await factory({
+    sessionId: "observer-session",
+    sampleRate: 16000,
+    channels: 1,
+    enablePartial: true,
+  });
+
+  const instance = FakeWebSocket.instances[0];
+  const appendPromise = connection.appendAudioChunk(Buffer.from("abc"));
+  instance.emit("open");
+  await appendPromise;
+  await connection.commit();
+
+  instance.emit("message", {
+    data: createDoubaoFullServerResponsePacket(
+      {
+        code: 1000,
+        result: [{ text: "你好", utterances: [{ text: "你好", definite: true }] }],
+      },
+      { sequence: -1 },
+    ),
+  });
+  instance.emit("close", { code: 1000, reason: "finish last sequence" });
+
+  assert.deepEqual(observed, [
+    {
+      type: "open",
+      event: {
+        sessionId: "observer-session",
+        wsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+        protocolMode: "bigmodel-v3",
+      },
+    },
+    {
+      type: "send",
+      event: {
+        sessionId: "observer-session",
+        kind: "full_request",
+        protocolMode: "bigmodel-v3",
+        packetBytes: instance.sent[0].length,
+        sequence: 1,
+      },
+    },
+    {
+      type: "send",
+      event: {
+        sessionId: "observer-session",
+        kind: "audio",
+        protocolMode: "bigmodel-v3",
+        packetBytes: instance.sent[1].length,
+        audioBytes: 3,
+        sequence: 2,
+      },
+    },
+    {
+      type: "send",
+      event: {
+        sessionId: "observer-session",
+        kind: "commit",
+        protocolMode: "bigmodel-v3",
+        packetBytes: instance.sent[2].length,
+        audioBytes: 0,
+        sequence: -3,
+      },
+    },
+    {
+      type: "receive",
+      event: {
+        sequence: -1,
+        payloadText: "{\"code\":1000,\"result\":[{\"text\":\"你好\",\"utterances\":[{\"text\":\"你好\",\"definite\":true}]}]}",
+        mappedEvents: [
+          { type: "final", text: "你好" },
+          { type: "completed", text: "你好" },
+        ],
+      },
+    },
+    {
+      type: "close",
+      event: {
+        sessionId: "observer-session",
+        protocolMode: "bigmodel-v3",
+        code: 1000,
+        reason: "finish last sequence",
+        terminalSeen: true,
+      },
+    },
   ]);
 });
 

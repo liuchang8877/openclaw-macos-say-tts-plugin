@@ -80,6 +80,53 @@ export type RealtimeTransportFactory = (params: {
   enablePartial: boolean;
 }) => Promise<RealtimeTransportConnection>;
 
+type DecodedDoubaoPacket = {
+  messageType: number;
+  flags: number;
+  serialization: number;
+  compression: number;
+  payload: Buffer;
+  errorCode?: number;
+  sequence?: number;
+};
+
+export type DoubaoRealtimeObserver = {
+  onOpen?: (event: {
+    sessionId: string;
+    wsUrl: string;
+    protocolMode: DoubaoProtocolMode;
+  }) => void;
+  onSend?: (event: {
+    sessionId: string;
+    kind: "full_request" | "audio" | "commit";
+    protocolMode: DoubaoProtocolMode;
+    packetBytes: number;
+    audioBytes?: number;
+    sequence?: number;
+  }) => void;
+  onReceive?: (event: {
+    sessionId: string;
+    protocolMode: DoubaoProtocolMode;
+    packet: DecodedDoubaoPacket;
+    payloadText: string;
+    response: DoubaoResponsePayload | null;
+    mappedEvents: RealtimeTransportEvent[];
+  }) => void;
+  onClose?: (event: {
+    sessionId: string;
+    protocolMode: DoubaoProtocolMode;
+    code: number;
+    reason: string;
+    terminalSeen: boolean;
+  }) => void;
+  onError?: (event: {
+    sessionId: string;
+    protocolMode: DoubaoProtocolMode;
+    stage: "connect" | "decode";
+    message: string;
+  }) => void;
+};
+
 type WebSocketLike = {
   readonly readyState?: number;
   binaryType?: string;
@@ -98,6 +145,7 @@ type WebSocketConstructor = new (
 
 type DoubaoTransportDependencies = {
   WebSocket: WebSocketConstructor;
+  observer?: DoubaoRealtimeObserver;
 };
 
 type DoubaoProtocolMode = "classic-v2" | "bigmodel-v3";
@@ -109,14 +157,16 @@ type DoubaoUtterance = {
   text?: string;
 };
 
+type DoubaoResponseResult = {
+  text?: string;
+  utterances?: DoubaoUtterance[];
+};
+
 type DoubaoResponsePayload = {
   code?: number;
   message?: string;
   sequence?: number;
-  result?: Array<{
-    text?: string;
-    utterances?: DoubaoUtterance[];
-  }>;
+  result?: DoubaoResponseResult | DoubaoResponseResult[];
 };
 
 type Deferred<T> = {
@@ -412,15 +462,7 @@ function normalizeIncomingBinaryMessage(data: unknown): Buffer {
   throw new Error("Unsupported upstream realtime payload type.");
 }
 
-export function decodeDoubaoPacket(data: Buffer): {
-  messageType: number;
-  flags: number;
-  serialization: number;
-  compression: number;
-  payload: Buffer;
-  errorCode?: number;
-  sequence?: number;
-} {
+export function decodeDoubaoPacket(data: Buffer): DecodedDoubaoPacket {
   if (data.length < 8) {
     throw new Error("Invalid upstream realtime packet: too short.");
   }
@@ -468,6 +510,30 @@ export function decodeDoubaoPacket(data: Buffer): {
   };
 }
 
+function tryParseDoubaoResponsePayload(packet: DecodedDoubaoPacket): DoubaoResponsePayload | null {
+  if (packet.messageType !== MESSAGE_TYPE_FULL_SERVER_RESPONSE && packet.messageType !== MESSAGE_TYPE_SERVER_ERROR_RESPONSE) {
+    return null;
+  }
+  if (packet.serialization !== SERIALIZATION_JSON) {
+    return null;
+  }
+  try {
+    return JSON.parse(packet.payload.toString("utf8")) as DoubaoResponsePayload;
+  } catch {
+    return null;
+  }
+}
+
+function resolveDoubaoResult(payload: DoubaoResponsePayload): DoubaoResponseResult | undefined {
+  if (Array.isArray(payload.result)) {
+    return payload.result[0];
+  }
+  if (payload.result && typeof payload.result === "object") {
+    return payload.result;
+  }
+  return undefined;
+}
+
 export function mapDoubaoResponseToRealtimeEvents(packet: {
   messageType: number;
   payload: Buffer;
@@ -510,7 +576,7 @@ export function mapDoubaoResponseToRealtimeEvents(packet: {
     ];
   }
 
-  const result = payload.result?.[0];
+  const result = resolveDoubaoResult(payload);
   const utterance = result?.utterances?.[0];
   const events: RealtimeTransportEvent[] = [];
   const sequence = typeof payload.sequence === "number" ? payload.sequence : packet.sequence ?? 0;
@@ -537,6 +603,8 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
   private readonly socket: WebSocketLike;
   private readonly openPromise: Promise<void>;
   private readonly protocolMode: DoubaoProtocolMode;
+  private readonly sessionId: string;
+  private readonly observer?: DoubaoRealtimeObserver;
   private eventHandler: (event: RealtimeTransportEvent) => void = () => {};
   private closed = false;
   private terminalSeen = false;
@@ -544,14 +612,18 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
 
   constructor(
     params: {
+      sessionId: string;
       wsUrl: string;
       headers: DoubaoWebSocketHeaders;
       initialPacket: Buffer;
       protocolMode: DoubaoProtocolMode;
+      observer?: DoubaoRealtimeObserver;
     },
     WebSocketImpl: WebSocketConstructor,
   ) {
+    this.sessionId = params.sessionId;
     this.protocolMode = params.protocolMode;
+    this.observer = params.observer;
     this.socket = new WebSocketImpl(params.wsUrl, {
       headers: params.headers,
     });
@@ -559,6 +631,18 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
     this.openPromise = new Promise<void>((resolve, reject) => {
       this.socket.addEventListener("open", () => {
         try {
+          this.observer?.onOpen?.({
+            sessionId: params.sessionId,
+            wsUrl: params.wsUrl,
+            protocolMode: params.protocolMode,
+          });
+          this.observer?.onSend?.({
+            sessionId: params.sessionId,
+            kind: "full_request",
+            protocolMode: params.protocolMode,
+            packetBytes: params.initialPacket.length,
+            sequence: params.protocolMode === "bigmodel-v3" ? 1 : undefined,
+          });
           this.socket.send(params.initialPacket);
           resolve();
         } catch (error) {
@@ -568,7 +652,16 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
       this.socket.addEventListener("message", (event) => {
         try {
           const packet = decodeDoubaoPacket(normalizeIncomingBinaryMessage(event.data));
-          for (const mappedEvent of mapDoubaoResponseToRealtimeEvents(packet)) {
+          const mappedEvents = mapDoubaoResponseToRealtimeEvents(packet);
+          this.observer?.onReceive?.({
+            sessionId: params.sessionId,
+            protocolMode: params.protocolMode,
+            packet,
+            payloadText: packet.payload.toString("utf8"),
+            response: tryParseDoubaoResponsePayload(packet),
+            mappedEvents,
+          });
+          for (const mappedEvent of mappedEvents) {
             if (mappedEvent.type === "completed" || mappedEvent.type === "error") {
               this.terminalSeen = true;
             }
@@ -576,6 +669,12 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
           }
         } catch (error) {
           this.terminalSeen = true;
+          this.observer?.onError?.({
+            sessionId: params.sessionId,
+            protocolMode: params.protocolMode,
+            stage: "decode",
+            message: error instanceof Error ? error.message : String(error),
+          });
           this.eventHandler({
             type: "error",
             code: "doubao_decode_error",
@@ -584,9 +683,22 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
         }
       });
       this.socket.addEventListener("error", (event) => {
+        this.observer?.onError?.({
+          sessionId: params.sessionId,
+          protocolMode: params.protocolMode,
+          stage: "connect",
+          message: event.error instanceof Error ? event.error.message : String(event.error ?? "Doubao realtime WebSocket failed to connect."),
+        });
         reject(event.error ?? new Error("Doubao realtime WebSocket failed to connect."));
       });
       this.socket.addEventListener("close", (event) => {
+        this.observer?.onClose?.({
+          sessionId: params.sessionId,
+          protocolMode: params.protocolMode,
+          code: event.code ?? 0,
+          reason: String(event.reason || ""),
+          terminalSeen: this.terminalSeen,
+        });
         if (!this.closed && !this.terminalSeen) {
           if (
             this.protocolMode === "bigmodel-v3" &&
@@ -619,22 +731,38 @@ class DoubaoRealtimeTransportConnection implements RealtimeTransportConnection {
 
   async appendAudioChunk(chunk: Buffer): Promise<void> {
     await this.openPromise;
-    this.socket.send(
-      createDoubaoAudioPacket(chunk, false, {
-        protocolMode: this.protocolMode,
-        sequence: this.protocolMode === "bigmodel-v3" ? this.nextAudioSequence++ : undefined,
-      }),
-    );
+    const sequence = this.protocolMode === "bigmodel-v3" ? this.nextAudioSequence++ : undefined;
+    const packet = createDoubaoAudioPacket(chunk, false, {
+      protocolMode: this.protocolMode,
+      sequence,
+    });
+    this.socket.send(packet);
+    this.observer?.onSend?.({
+      sessionId: this.sessionId,
+      kind: "audio",
+      protocolMode: this.protocolMode,
+      packetBytes: packet.length,
+      audioBytes: chunk.length,
+      sequence,
+    });
   }
 
   async commit(): Promise<void> {
     await this.openPromise;
-    this.socket.send(
-      createDoubaoAudioPacket(Buffer.alloc(0), true, {
-        protocolMode: this.protocolMode,
-        sequence: this.protocolMode === "bigmodel-v3" ? -this.nextAudioSequence++ : undefined,
-      }),
-    );
+    const sequence = this.protocolMode === "bigmodel-v3" ? -this.nextAudioSequence++ : undefined;
+    const packet = createDoubaoAudioPacket(Buffer.alloc(0), true, {
+      protocolMode: this.protocolMode,
+      sequence,
+    });
+    this.socket.send(packet);
+    this.observer?.onSend?.({
+      sessionId: this.sessionId,
+      kind: "commit",
+      protocolMode: this.protocolMode,
+      packetBytes: packet.length,
+      audioBytes: 0,
+      sequence,
+    });
   }
 
   async cancel(): Promise<void> {
@@ -695,6 +823,8 @@ export function createDoubaoRealtimeTransportFactory(
         headers: createDoubaoWebSocketHeaders(config, params.sessionId),
         initialPacket,
         protocolMode,
+        sessionId: params.sessionId,
+        observer: deps.observer,
       },
       deps.WebSocket,
     );
@@ -715,6 +845,7 @@ export class RealtimeSession {
   private closed = false;
   private touchedAt = Date.now();
   private totalAudioBytes = 0;
+  private totalAudioChunks = 0;
 
   constructor(
     params: RealtimeSessionStartParams,
@@ -753,6 +884,10 @@ export class RealtimeSession {
     return this.totalAudioBytes;
   }
 
+  get audioChunks(): number {
+    return this.totalAudioChunks;
+  }
+
   get isClosed(): boolean {
     return this.closed;
   }
@@ -777,9 +912,14 @@ export class RealtimeSession {
   }
 
   async appendAudioBase64(audioBase64: string): Promise<void> {
-    this.ensureConnection();
     const chunk = decodeAudioBase64(audioBase64);
+    await this.appendAudioChunk(chunk);
+  }
+
+  async appendAudioChunk(chunk: Buffer): Promise<void> {
+    this.ensureConnection();
     this.totalAudioBytes += chunk.length;
+    this.totalAudioChunks += 1;
     this.touch();
     await this.connection!.appendAudioChunk(chunk);
   }

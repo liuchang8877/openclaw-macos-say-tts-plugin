@@ -5,6 +5,7 @@
   "description": "External OpenClaw plugin that exposes /v1/audio/speech via macOS say",
   "type": "module",
   "scripts": {
+    "replay:realtime": "node realtime-replay.ts",
     "test": "node --test ./*.test.mjs",
     "start:realtime-sidecar": "node realtime-sidecar.ts"
   },

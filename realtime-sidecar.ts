@@ -1,7 +1,10 @@
 import { createServer } from "node:http";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import {
   REALTIME_ASR_PATH,
   createDoubaoRealtimeTransportFactory,
+  type DoubaoRealtimeObserver,
   getRealtimeCapability,
   RealtimeSessionManager,
   type RealtimePluginConfig,
@@ -12,6 +15,8 @@ type SidecarConfig = RealtimePluginConfig & {
   listenHost?: string;
   listenPort?: number;
   sidecarAuthToken?: string;
+  pcmDumpDir?: string;
+  inputGain?: number;
 };
 
 type RealtimeActionRequest = {
@@ -23,6 +28,15 @@ type RealtimeActionRequest = {
   channels?: unknown;
   language?: unknown;
   enable_partial?: unknown;
+};
+
+type DownstreamSessionStats = {
+  packets: number;
+  partials: number;
+  finals: number;
+  completions: number;
+  lastCloseCode?: number;
+  lastCloseReason?: string;
 };
 
 class RequestValidationError extends Error {
@@ -45,6 +59,14 @@ function resolveNumber(value: string | undefined): number | undefined {
   }
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function resolvePositiveNumber(value: string | undefined, fallback: number): number {
+  const parsed = resolveNumber(value);
+  if (parsed === undefined || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
 }
 
 function resolveBooleanEnv(value: string | undefined, fallback: boolean): boolean {
@@ -80,7 +102,43 @@ function loadSidecarConfig(env: NodeJS.ProcessEnv = process.env): SidecarConfig 
     listenHost: env.REALTIME_SIDECAR_HOST || "127.0.0.1",
     listenPort: resolveNumber(env.REALTIME_SIDECAR_PORT) ?? 8765,
     sidecarAuthToken: env.REALTIME_SIDECAR_AUTH_TOKEN,
+    pcmDumpDir: normalizeTrimmedString(env.REALTIME_SIDECAR_PCM_DUMP_DIR) || undefined,
+    inputGain: resolvePositiveNumber(env.REALTIME_SIDECAR_INPUT_GAIN, 1),
   };
+}
+
+function decodeAudioBase64(audioBase64: string): Buffer {
+  const normalized = audioBase64.trim();
+  if (!normalized) {
+    throw new RequestValidationError(400, "Missing `audio_base64`.");
+  }
+  const buffer = Buffer.from(normalized, "base64");
+  if (!buffer.length || buffer.toString("base64").replace(/=+$/, "") !== normalized.replace(/=+$/, "")) {
+    throw new RequestValidationError(400, "Invalid `audio_base64`.");
+  }
+  return buffer;
+}
+
+function applyPcmS16LeGain(chunk: Buffer, gain: number): { chunk: Buffer; clippedSamples: number } {
+  if (!Number.isFinite(gain) || gain <= 0 || Math.abs(gain - 1) < 1e-9) {
+    return { chunk, clippedSamples: 0 };
+  }
+
+  const amplified = Buffer.allocUnsafe(chunk.length);
+  let clippedSamples = 0;
+  for (let offset = 0; offset + 1 < chunk.length; offset += 2) {
+    const sample = chunk.readInt16LE(offset);
+    let scaled = Math.round(sample * gain);
+    if (scaled > 32767) {
+      scaled = 32767;
+      clippedSamples += 1;
+    } else if (scaled < -32768) {
+      scaled = -32768;
+      clippedSamples += 1;
+    }
+    amplified.writeInt16LE(scaled, offset);
+  }
+  return { chunk: amplified, clippedSamples };
 }
 
 function respondJson(res: import("node:http").ServerResponse, status: number, payload: unknown): void {
@@ -201,14 +259,120 @@ function isAuthorized(req: import("node:http").IncomingMessage, authToken: strin
   return header.trim() === `Bearer ${authToken}`;
 }
 
+function summarizeText(value: string | undefined, maxLength: number = 160): string {
+  const normalized = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 3)}...`;
+}
+
 async function startSidecar(config: SidecarConfig): Promise<void> {
   const capability = getRealtimeCapability(config);
   if (!capability.configured) {
     throw new Error("Realtime sidecar config is incomplete. Check DOUBAO_APP_ID, DOUBAO_ACCESS_TOKEN, DOUBAO_WS_URL and DOUBAO_CLUSTER.");
   }
 
-  const manager = new RealtimeSessionManager(config, createDoubaoRealtimeTransportFactory(config));
+  const downstreamStats = new Map<string, DownstreamSessionStats>();
+  const transportObserver: DoubaoRealtimeObserver = {
+    onOpen(event) {
+      console.info(
+        `[realtime-sidecar] doubao.open ${event.sessionId} protocol=${event.protocolMode} ws=${event.wsUrl}`,
+      );
+    },
+    onSend(event) {
+      if (event.kind === "audio") {
+        return;
+      }
+      console.info(
+        `[realtime-sidecar] doubao.send ${event.sessionId} kind=${event.kind} protocol=${event.protocolMode} ` +
+          `packetBytes=${event.packetBytes}` +
+          (typeof event.audioBytes === "number" ? ` audioBytes=${event.audioBytes}` : "") +
+          (typeof event.sequence === "number" ? ` sequence=${event.sequence}` : ""),
+      );
+    },
+    onReceive(event) {
+      const stats = downstreamStats.get(event.sessionId) ?? {
+        packets: 0,
+        partials: 0,
+        finals: 0,
+        completions: 0,
+      };
+      stats.packets += 1;
+      for (const mappedEvent of event.mappedEvents) {
+        if (mappedEvent.type === "partial") {
+          stats.partials += 1;
+        } else if (mappedEvent.type === "final") {
+          stats.finals += 1;
+        } else if (mappedEvent.type === "completed") {
+          stats.completions += 1;
+        }
+      }
+      downstreamStats.set(event.sessionId, stats);
+
+      const result = Array.isArray(event.response?.result)
+        ? event.response?.result[0]
+        : event.response?.result;
+      const utterance = result?.utterances?.[0];
+      const mapped = event.mappedEvents
+        .map((mappedEvent) => {
+          if (mappedEvent.type === "partial" || mappedEvent.type === "final") {
+            return `${mappedEvent.type}:${summarizeText(mappedEvent.text, 60) || "<empty>"}`;
+          }
+          if (mappedEvent.type === "completed") {
+            return `completed:${summarizeText(mappedEvent.text, 60) || "<empty>"}`;
+          }
+          return `error:${mappedEvent.code}`;
+        })
+        .join("|");
+
+      console.info(
+        `[realtime-sidecar] doubao.recv ${event.sessionId} protocol=${event.protocolMode} ` +
+          `packetType=${event.packet.messageType} flags=${event.packet.flags} ` +
+          `serialization=${event.packet.serialization} compression=${event.packet.compression} ` +
+          `packetSeq=${event.packet.sequence ?? "none"} responseSeq=${event.response?.sequence ?? "none"} ` +
+          `code=${event.response?.code ?? event.packet.errorCode ?? 1000} ` +
+          `payloadBytes=${event.packet.payload.length} ` +
+          `utteranceDefinite=${utterance?.definite === true ? "true" : utterance?.definite === false ? "false" : "none"} ` +
+          `utteranceText="${summarizeText(utterance?.text)}" resultText="${summarizeText(result?.text)}" ` +
+          `mapped=${mapped || "none"} payload="${summarizeText(event.payloadText, 320)}"`,
+      );
+    },
+    onClose(event) {
+      const stats = downstreamStats.get(event.sessionId) ?? {
+        packets: 0,
+        partials: 0,
+        finals: 0,
+        completions: 0,
+      };
+      stats.lastCloseCode = event.code;
+      stats.lastCloseReason = event.reason;
+      downstreamStats.set(event.sessionId, stats);
+      console.info(
+        `[realtime-sidecar] doubao.close ${event.sessionId} protocol=${event.protocolMode} ` +
+          `code=${event.code} reason="${summarizeText(event.reason, 120)}" terminalSeen=${event.terminalSeen}`,
+      );
+    },
+    onError(event) {
+      console.error(
+        `[realtime-sidecar] doubao.error ${event.sessionId} protocol=${event.protocolMode} ` +
+          `stage=${event.stage} message="${summarizeText(event.message, 240)}"`,
+      );
+    },
+  };
+
+  const manager = new RealtimeSessionManager(
+    config,
+    createDoubaoRealtimeTransportFactory(config, {
+      WebSocket: globalThis.WebSocket as typeof WebSocket,
+      observer: transportObserver,
+    }),
+  );
   const events = new Map<string, RealtimeSessionEvent[]>();
+  const pcmDumpPaths = new Map<string, string>();
 
   function drainRealtimeEvents(sessionId: string): RealtimeSessionEvent[] {
     const value = events.get(sessionId) ?? [];
@@ -233,6 +397,7 @@ async function startSidecar(config: SidecarConfig): Promise<void> {
           sessions: manager.size,
           backend: capability.backend,
           configured: capability.configured,
+          input_gain: config.inputGain ?? 1,
         });
         return;
       }
@@ -261,6 +426,18 @@ async function startSidecar(config: SidecarConfig): Promise<void> {
         });
         const startedAt = Date.now();
         events.set(session.id, []);
+        downstreamStats.set(session.id, {
+          packets: 0,
+          partials: 0,
+          finals: 0,
+          completions: 0,
+        });
+        if (config.pcmDumpDir) {
+          const dumpPath = join(config.pcmDumpDir, `openclaw-realtime-${session.id}.pcm`);
+          await mkdir(config.pcmDumpDir, { recursive: true });
+          await writeFile(dumpPath, "");
+          pcmDumpPaths.set(session.id, dumpPath);
+        }
         session.onEvent((event) => {
           if (event.type === "transcript.partial") {
             const current = events.get(session.id) ?? [];
@@ -268,10 +445,17 @@ async function startSidecar(config: SidecarConfig): Promise<void> {
               console.info(`[realtime-sidecar] first partial ${session.id} after ${Date.now() - startedAt}ms`);
             }
           }
+          if (event.type === "transcript.final") {
+            console.info(`[realtime-sidecar] final ${session.id} chars=${event.text.length}`);
+          }
           pushRealtimeEvent(session.id, event);
         });
         await session.start();
-        console.info(`[realtime-sidecar] session started ${session.id}`);
+        console.info(
+          `[realtime-sidecar] session started ${session.id}` +
+            ` inputGain=${config.inputGain ?? 1}` +
+            (pcmDumpPaths.has(session.id) ? ` pcmDump=${pcmDumpPaths.get(session.id)}` : ""),
+        );
         respondJson(res, 200, {
           session_id: session.id,
           events: drainRealtimeEvents(session.id),
@@ -295,7 +479,23 @@ async function startSidecar(config: SidecarConfig): Promise<void> {
         if (typeof body.audio_base64 !== "string" || !body.audio_base64.trim()) {
           throw new RequestValidationError(400, "Missing `audio_base64`.");
         }
-        await session.appendAudioBase64(body.audio_base64);
+        const rawChunk = decodeAudioBase64(body.audio_base64);
+        const { chunk, clippedSamples } = applyPcmS16LeGain(rawChunk, config.inputGain ?? 1);
+        const pcmDumpPath = pcmDumpPaths.get(session.id);
+        if (pcmDumpPath) {
+          try {
+            await appendFile(pcmDumpPath, chunk);
+          } catch (error) {
+            console.error(`[realtime-sidecar] pcm dump append failed ${session.id} path=${pcmDumpPath}`, error);
+          }
+        }
+        await session.appendAudioChunk(chunk);
+        console.info(
+          `[realtime-sidecar] audio.append ${session.id} ` +
+            `chunkBytes=${chunk.length} audioBytes=${session.audioBytes} chunks=${session.audioChunks} ` +
+            `inputGain=${config.inputGain ?? 1} clippedSamples=${clippedSamples}` +
+            (pcmDumpPath ? ` pcmDump=${pcmDumpPath}` : ""),
+        );
         respondJson(res, 200, {
           session_id: session.id,
           events: drainRealtimeEvents(session.id),
@@ -308,9 +508,21 @@ async function startSidecar(config: SidecarConfig): Promise<void> {
           const commitStartedAt = Date.now();
           const finalText = await session.commit();
           const resultEvents = drainRealtimeEvents(session.id);
+          const pcmDumpPath = pcmDumpPaths.get(session.id);
+          const stats = downstreamStats.get(session.id);
           await manager.closeSession(session.id);
           events.delete(session.id);
-          console.info(`[realtime-sidecar] session committed ${session.id} in ${Date.now() - commitStartedAt}ms finalChars=${finalText.length}`);
+          pcmDumpPaths.delete(session.id);
+          downstreamStats.delete(session.id);
+          console.info(
+            `[realtime-sidecar] session committed ${session.id} in ${Date.now() - commitStartedAt}ms ` +
+              `audioBytes=${session.audioBytes} chunks=${session.audioChunks} finalChars=${finalText.length}` +
+              ` downstreamPackets=${stats?.packets ?? 0} partials=${stats?.partials ?? 0}` +
+              ` finals=${stats?.finals ?? 0} completions=${stats?.completions ?? 0}` +
+              (typeof stats?.lastCloseCode === "number" ? ` closeCode=${stats.lastCloseCode}` : "") +
+              (stats?.lastCloseReason ? ` closeReason="${summarizeText(stats.lastCloseReason, 120)}"` : "") +
+              (pcmDumpPath ? ` pcmDump=${pcmDumpPath}` : ""),
+          );
           respondJson(res, 200, {
             session_id: session.id,
             final_text: finalText,
@@ -319,8 +531,22 @@ async function startSidecar(config: SidecarConfig): Promise<void> {
           return;
         } catch (error) {
           const resultEvents = drainRealtimeEvents(session.id);
+          const pcmDumpPath = pcmDumpPaths.get(session.id);
+          const stats = downstreamStats.get(session.id);
           await manager.closeSession(session.id);
           events.delete(session.id);
+          pcmDumpPaths.delete(session.id);
+          downstreamStats.delete(session.id);
+          console.error(
+            `[realtime-sidecar] session commit failed ${session.id} ` +
+              `audioBytes=${session.audioBytes} chunks=${session.audioChunks}` +
+              ` downstreamPackets=${stats?.packets ?? 0} partials=${stats?.partials ?? 0}` +
+              ` finals=${stats?.finals ?? 0} completions=${stats?.completions ?? 0}` +
+              (typeof stats?.lastCloseCode === "number" ? ` closeCode=${stats.lastCloseCode}` : "") +
+              (stats?.lastCloseReason ? ` closeReason="${summarizeText(stats.lastCloseReason, 120)}"` : "") +
+              (pcmDumpPath ? ` pcmDump=${pcmDumpPath}` : ""),
+            error,
+          );
           respondJson(res, 502, {
             error: {
               message: error instanceof Error ? error.message : String(error),
@@ -334,9 +560,14 @@ async function startSidecar(config: SidecarConfig): Promise<void> {
 
       await session.cancel();
       const resultEvents = drainRealtimeEvents(session.id);
+      const stats = downstreamStats.get(session.id);
       await manager.closeSession(session.id);
       events.delete(session.id);
-      console.info(`[realtime-sidecar] session cancelled ${session.id}`);
+      pcmDumpPaths.delete(session.id);
+      downstreamStats.delete(session.id);
+      console.info(
+        `[realtime-sidecar] session cancelled ${session.id} downstreamPackets=${stats?.packets ?? 0}`,
+      );
       respondJson(res, 200, {
         session_id: session.id,
         events: resultEvents,
