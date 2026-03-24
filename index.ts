@@ -136,6 +136,10 @@ async function readJsonBody(req: IncomingMessage): Promise<SpeechRequest> {
 
 async function readJsonBodyAny(req: IncomingMessage): Promise<Record<string, unknown>> {
   const raw = await readRequestBody(req, DEFAULT_MAX_AUDIO_BYTES);
+  return parseJsonObject(raw);
+}
+
+function parseJsonObject(raw: Buffer): Record<string, unknown> {
   if (!raw.length) {
     return {};
   }
@@ -333,7 +337,7 @@ function getRealtimeProxyConfig(config: PluginConfig) {
 }
 
 async function proxyRealtimeRequest(params: {
-  req: IncomingMessage;
+  rawBody: Buffer;
   config: PluginConfig;
 }): Promise<Response> {
   const proxyConfig = getRealtimeProxyConfig(params.config);
@@ -344,7 +348,6 @@ async function proxyRealtimeRequest(params: {
     );
   }
 
-  const body = await readRequestBody(params.req, DEFAULT_MAX_AUDIO_BYTES);
   const headers = new Headers();
   headers.set("content-type", "application/json");
   if (proxyConfig.sidecarAuthToken) {
@@ -354,7 +357,7 @@ async function proxyRealtimeRequest(params: {
   return await fetch(`${proxyConfig.sidecarBaseUrl}${REALTIME_ASR_PATH}`, {
     method: "POST",
     headers,
-    body,
+    body: params.rawBody,
   });
 }
 
@@ -792,7 +795,8 @@ function createRealtimeAsrHandler(
         });
         return true;
       }
-      const body = await readJsonBodyAny(req) as RealtimeActionRequest;
+      const rawBody = await readRequestBody(req, DEFAULT_MAX_AUDIO_BYTES);
+      const body = parseJsonObject(rawBody) as RealtimeActionRequest;
       const action = resolveRealtimeActionType(body.type);
       if (action === "session.start") {
         resolveRealtimeAudioFormat(body.audio_format);
@@ -810,7 +814,7 @@ function createRealtimeAsrHandler(
       }
 
       const startedAt = Date.now();
-      const upstream = await proxyRealtimeRequest({ req, config });
+      const upstream = await proxyRealtimeRequest({ rawBody, config });
       if (action === "session.start") {
         api.logger.info(`macos-say-tts realtime sidecar session.start responded in ${Date.now() - startedAt}ms`);
       } else if (action === "audio.append") {
