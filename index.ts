@@ -90,6 +90,10 @@ type RealtimeSessionState = {
   events: Map<string, RealtimeSessionEvent[]>;
 };
 
+type SharedRealtimeStateStore = Map<string, RealtimeSessionState>;
+
+const SHARED_REALTIME_STATE_KEY = "__openclaw_macos_say_tts_realtime_state__";
+
 class RequestValidationError extends Error {
   statusCode: number;
 
@@ -323,14 +327,40 @@ function resolveRealtimeAudioFormat(value: unknown): "pcm_s16le" {
 function ensureRealtimeSessionState(
   config: PluginConfig,
 ): RealtimeSessionState {
+  const store = getSharedRealtimeStateStore();
   const capability = getRealtimeCapability(config);
+  const configKey = JSON.stringify({
+    backend: capability.backend,
+    wsUrl: capability.wsUrl,
+    cluster: capability.cluster,
+    language: capability.language,
+    chunkMs: capability.chunkMs,
+    appId: config.doubaoAppId ?? "",
+  });
+  const existing = store.get(configKey);
+  if (existing) {
+    return existing;
+  }
+
   const transportFactory = capability.enabled && capability.configured
     ? createDoubaoRealtimeTransportFactory(config)
     : null;
-  return {
+  const state = {
     manager: transportFactory ? new RealtimeSessionManager(config, transportFactory) : null,
     events: new Map<string, RealtimeSessionEvent[]>(),
   };
+  store.set(configKey, state);
+  return state;
+}
+
+function getSharedRealtimeStateStore(): SharedRealtimeStateStore {
+  const globalState = globalThis as typeof globalThis & {
+    [SHARED_REALTIME_STATE_KEY]?: SharedRealtimeStateStore;
+  };
+  if (!globalState[SHARED_REALTIME_STATE_KEY]) {
+    globalState[SHARED_REALTIME_STATE_KEY] = new Map<string, RealtimeSessionState>();
+  }
+  return globalState[SHARED_REALTIME_STATE_KEY]!;
 }
 
 function drainRealtimeEvents(state: RealtimeSessionState, sessionId: string): RealtimeSessionEvent[] {
