@@ -1036,7 +1036,7 @@ function createResponsesHandler(api: OpenClawPluginApi): OpenClawPluginHttpRoute
       api.logger.info(`/v1/responses final text sent to Pi: ${JSON.stringify(text)}`);
 
       res.writeHead(200, {
-        "Content-Type": "text/event-stream",
+        "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
       });
