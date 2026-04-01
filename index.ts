@@ -946,6 +946,102 @@ function createTtsCommand(params: {
   };
 }
 
+const RESPONSES_PATH = "/v1/responses";
+const RESPONSES_SESSION_KEY = "agent:main:pizero";
+
+function createResponsesHandler(api: OpenClawPluginApi): OpenClawPluginHttpRouteHandler {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    if (req.method !== "POST") {
+      respondText(res, 405, "Method not allowed");
+      return;
+    }
+    let body: Record<string, unknown>;
+    try {
+      const raw = await readRequestBody(req, MAX_BODY_BYTES);
+      body = JSON.parse(raw.toString("utf8")) as Record<string, unknown>;
+    } catch {
+      respondJson(res, 400, { error: { message: "Invalid JSON body." } });
+      return;
+    }
+    const input = body.input;
+    let message = "";
+    if (typeof input === "string") {
+      message = input.trim();
+    } else if (Array.isArray(input)) {
+      // OpenAI Responses API list format — find last user message
+      for (let i = input.length - 1; i >= 0; i--) {
+        const item = input[i] as Record<string, unknown>;
+        if (item?.role === "user" && typeof item?.content === "string") {
+          message = item.content.trim();
+          break;
+        }
+      }
+    }
+    if (!message) {
+      respondJson(res, 400, { error: { message: "Missing `input`." } });
+      return;
+    }
+    try {
+      const { runId } = await api.runtime.subagent.run({
+        sessionKey: RESPONSES_SESSION_KEY,
+        message,
+        idempotencyKey: randomUUID(),
+      });
+      const result = await api.runtime.subagent.waitForRun({ runId, timeoutMs: 120000 });
+      if (result.status === "error") {
+        respondJson(res, 500, { error: { message: result.error ?? "Agent error." } });
+        return;
+      }
+      if (result.status === "timeout") {
+        respondJson(res, 504, { error: { message: "Agent timed out." } });
+        return;
+      }
+      const { messages } = await api.runtime.subagent.getSessionMessages({
+        sessionKey: RESPONSES_SESSION_KEY,
+        limit: 1,
+      });
+      const last = messages[0] as Record<string, unknown> | undefined;
+      let text = "";
+      const content = last?.content;
+      if (typeof content === "string") {
+        text = content;
+      } else if (Array.isArray(content)) {
+        // Extract text blocks, skip thinking blocks
+        text = content
+          .filter((b: unknown) => (b as Record<string, unknown>)?.type === "text")
+          .map((b: unknown) => (b as Record<string, unknown>)?.text ?? "")
+          .join("")
+          .trim();
+        // Strip <final>...</final> wrapper if present
+        const finalMatch = text.match(/<final>([\s\S]*?)<\/final>/);
+        if (finalMatch) text = finalMatch[1].trim();
+      }
+      // Strip markdown formatting and emoji
+      text = text
+        .replace(/\*\*(.+?)\*\*/g, "$1")   // **bold**
+        .replace(/\*(.+?)\*/g, "$1")         // *italic*
+        .replace(/`(.+?)`/g, "$1")           // `code`
+        .replace(/#{1,6}\s+/g, "")           // # headings
+        .replace(/\n{2,}/g, " ")             // multiple newlines → space
+        .replace(/[\u{1F000}-\u{1FFFF}]/gu, "")  // emoji (supplementary planes)
+        .replace(/[\u2600-\u27FF]/g, "")     // misc symbols & dingbats
+        .trim();
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      res.write(`data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: "response.completed" })}\n\n`);
+      res.end();
+    } catch (error) {
+      api.logger.error(`/v1/responses handler failed: ${String(error)}`);
+      respondJson(res, 500, { error: { message: "Agent invocation failed." } });
+    }
+  };
+}
+
 const plugin = {
   id: "macos-say-tts",
   name: "macOS Say TTS",
@@ -978,6 +1074,11 @@ const plugin = {
       auth: "plugin",
       match: "prefix",
       handler: createMediaHandler(api, state),
+    });
+    api.registerHttpRoute({
+      path: RESPONSES_PATH,
+      auth: "gateway",
+      handler: createResponsesHandler(api),
     });
     api.registerCommand(createTtsCommand({ api, config, state }));
   },
