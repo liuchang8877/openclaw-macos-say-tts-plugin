@@ -643,7 +643,7 @@ function createSpeechHandler(api: OpenClawPluginApi, config: PluginConfig): Open
     try {
       const body = await readJsonBody(req);
       const text = typeof body.input === "string" ? body.input.trim() : "";
-      const voice = typeof body.voice === "string" && body.voice.trim() ? body.voice.trim() : defaultVoice;
+      const voice = defaultVoice;
 
       if (!text) {
         respondJson(res, 400, { error: { message: "Missing `input` text." } });
