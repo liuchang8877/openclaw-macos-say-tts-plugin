@@ -1023,16 +1023,28 @@ function createResponsesHandler(api: OpenClawPluginApi): OpenClawPluginHttpRoute
         if (finalMatch) text = finalMatch[1].trim();
       }
       api.logger.info(`/v1/responses extracted text before strip: ${JSON.stringify(text)}`);
-      // Strip markdown formatting and emoji
+      // Convert common emoji to Chinese words before stripping
+      const EMOJI_ZH: Record<string, string> = {
+        "👋": "你好", "👍": "好的", "👎": "不好", "😊": "好的", "😄": "哈哈",
+        "😂": "哈哈", "🤣": "哈哈", "😍": "太好了", "🤔": "嗯", "😅": "哈",
+        "😭": "呜呜", "😱": "天哪", "😡": "生气", "🙏": "谢谢", "❤️": "心",
+        "💪": "加油", "🎉": "太好了", "✅": "好的", "❌": "不行", "⭐": "星",
+        "🌟": "棒", "🔥": "厉害", "💯": "完美", "🚀": "出发", "✨": "棒",
+      };
+      text = text.replace(/[\u{1F000}-\u{1FFFF}\u2600-\u27FF\u2B50-\u2B55\u231A-\u231B\u23E9-\u23F3\u25AA-\u25FE\u2614-\u2615\u2648-\u2653\u267F\u2693\u26A1\u26AA-\u26AB\u26BD-\u26BE\u26C4-\u26C5\u26CE\u26D4\u26EA\u26F2-\u26F3\u26F5\u26FA\u26FD\u2702\u2705\u2708-\u270D\u270F\u2712\u2714\u2716\u271D\u2721\u2728\u2733-\u2734\u2744\u2747\u274C\u274E\u2753-\u2755\u2757\u2763-\u2764\u2795-\u2797\u27A1\u27B0\u27BF\u2934-\u2935\u2B05-\u2B07\u2B1B-\u2B1C\u2B50\u2B55\u3030\u303D\u3297\u3299]/gu, (ch) => {
+        return EMOJI_ZH[ch] ?? "";
+      });
+      // Strip markdown formatting
       text = text
         .replace(/\*\*(.+?)\*\*/g, "$1")   // **bold**
         .replace(/\*(.+?)\*/g, "$1")         // *italic*
         .replace(/`(.+?)`/g, "$1")           // `code`
         .replace(/#{1,6}\s+/g, "")           // # headings
         .replace(/\n+/g, " ")                // any newlines → space
-        .replace(/[\u{1F000}-\u{1FFFF}]/gu, "")  // emoji (supplementary planes)
-        .replace(/[\u2600-\u27FF]/g, "")     // misc symbols & dingbats
+        .replace(/\s{2,}/g, " ")             // collapse extra spaces
         .trim();
+      // Fallback: if all content was emoji and nothing remains, say "好的"
+      if (!text) text = "好的";
       api.logger.info(`/v1/responses final text sent to Pi: ${JSON.stringify(text)}`);
 
       res.writeHead(200, {
