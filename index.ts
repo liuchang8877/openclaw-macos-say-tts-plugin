@@ -1000,7 +1000,13 @@ function createResponsesHandler(api: OpenClawPluginApi): OpenClawPluginHttpRoute
         sessionKey: RESPONSES_SESSION_KEY,
         limit: 1,
       });
-      const last = messages[0] as Record<string, unknown> | undefined;
+      api.logger.info(`/v1/responses raw messages[0]: ${JSON.stringify(messages[0])}`);
+      const lastRaw = messages[0] as Record<string, unknown> | undefined;
+      // Handle both direct {role, content} and wrapped {type:"message", message:{role,content}} formats
+      const last: Record<string, unknown> | undefined =
+        lastRaw?.type === "message" && lastRaw?.message
+          ? (lastRaw.message as Record<string, unknown>)
+          : lastRaw;
       let text = "";
       const content = last?.content;
       if (typeof content === "string") {
@@ -1016,16 +1022,18 @@ function createResponsesHandler(api: OpenClawPluginApi): OpenClawPluginHttpRoute
         const finalMatch = text.match(/<final>([\s\S]*?)<\/final>/);
         if (finalMatch) text = finalMatch[1].trim();
       }
+      api.logger.info(`/v1/responses extracted text before strip: ${JSON.stringify(text)}`);
       // Strip markdown formatting and emoji
       text = text
         .replace(/\*\*(.+?)\*\*/g, "$1")   // **bold**
         .replace(/\*(.+?)\*/g, "$1")         // *italic*
         .replace(/`(.+?)`/g, "$1")           // `code`
         .replace(/#{1,6}\s+/g, "")           // # headings
-        .replace(/\n{2,}/g, " ")             // multiple newlines → space
+        .replace(/\n+/g, " ")                // any newlines → space
         .replace(/[\u{1F000}-\u{1FFFF}]/gu, "")  // emoji (supplementary planes)
         .replace(/[\u2600-\u27FF]/g, "")     // misc symbols & dingbats
         .trim();
+      api.logger.info(`/v1/responses final text sent to Pi: ${JSON.stringify(text)}`);
 
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
