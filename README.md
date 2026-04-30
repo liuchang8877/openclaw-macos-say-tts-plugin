@@ -178,9 +178,9 @@ Run the sidecar on the OpenClaw host, not on the Pi:
 cd /path/to/openclaw-macos-say-tts-plugin
 export DOUBAO_APP_ID="your-app-id"
 export DOUBAO_ACCESS_TOKEN="your-access-token"
-export DOUBAO_WS_URL="wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
-export DOUBAO_CLUSTER="volcengine_input_common"
-export DOUBAO_LANGUAGE="zh"
+export DOUBAO_WS_URL="wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+export DOUBAO_RESOURCE_ID="volc.seedasr.sauc.duration"
+export DOUBAO_LANGUAGE="zh-CN"
 export REALTIME_SIDECAR_HOST="127.0.0.1"
 export REALTIME_SIDECAR_PORT="8765"
 export REALTIME_SIDECAR_AUTH_TOKEN="replace-with-a-local-secret"
@@ -209,9 +209,9 @@ cd /path/to/openclaw-macos-say-tts-plugin
 nohup env \
   DOUBAO_APP_ID="your-app-id" \
   DOUBAO_ACCESS_TOKEN="your-access-token" \
-  DOUBAO_WS_URL="wss://openspeech.bytedance.com/api/v3/sauc/bigmodel" \
-  DOUBAO_CLUSTER="volcengine_input_common" \
-  DOUBAO_LANGUAGE="zh" \
+  DOUBAO_WS_URL="wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async" \
+  DOUBAO_RESOURCE_ID="volc.seedasr.sauc.duration" \
+  DOUBAO_LANGUAGE="zh-CN" \
   REALTIME_SIDECAR_HOST="127.0.0.1" \
   REALTIME_SIDECAR_PORT="8765" \
   REALTIME_SIDECAR_AUTH_TOKEN="replace-with-a-local-secret" \

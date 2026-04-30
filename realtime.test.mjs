@@ -80,9 +80,9 @@ test("doubao realtime capability reports configured only when required fields ar
   );
 
   const capability = getRealtimeCapability({
-    transcriptionBackend: "doubao-realtime",
-    doubaoChunkMs: 120,
-    doubaoEnableVad: true,
+      transcriptionBackend: "doubao-realtime",
+      doubaoChunkMs: 120,
+      doubaoEnableVad: true,
     doubaoVadStartSilenceMs: 700,
     doubaoVadEndSilenceMs: 900,
     realtimeSessionTimeoutSeconds: 180,
@@ -93,7 +93,7 @@ test("doubao realtime capability reports configured only when required fields ar
     enabled: true,
     configured: false,
     wsUrl: "",
-    cluster: "",
+    cluster: "volc.bigasr.sauc.duration",
     language: "",
     chunkMs: 120,
     enableVad: true,
@@ -124,6 +124,7 @@ test("realtime session forwards partial and final transcript events", async () =
   });
 
   await session.start();
+  assert.equal(transport.connections.length, 0);
   await session.appendAudioBase64(Buffer.from("hello").toString("base64"));
   transport.connections[0].emit({ type: "partial", text: "你好，我想问" });
   transport.connections[0].emit({ type: "final", text: "你好，我想问一下。", utteranceId: "u1" });
@@ -163,6 +164,7 @@ test("realtime session propagates upstream errors to commit caller", async () =>
   });
 
   await session.start();
+  await session.appendAudioBase64(Buffer.from("hello").toString("base64"));
   const commitPromise = session.commit();
   transport.connections[0].emit({
     type: "error",
@@ -198,7 +200,7 @@ test("session manager prunes expired sessions", async () => {
 
   assert.deepEqual(expiredIds, [session.id]);
   assert.equal(manager.size, 0);
-  assert.equal(transport.connections[0].closed, true);
+  assert.equal(transport.connections.length, 0);
 });
 
 test("full request packet encodes doubao session settings", () => {
@@ -243,15 +245,15 @@ test("bigmodel v3 request packet encodes official websocket payload fields", () 
       transcriptionBackend: "doubao-realtime",
       doubaoAppId: "app-123",
       doubaoAccessToken: "token-456",
-      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
-      doubaoResourceId: "volc.bigasr.sauc.duration",
-      doubaoLanguage: "zh",
+      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
+      doubaoResourceId: "volc.seedasr.sauc.duration",
+      doubaoLanguage: "zh-CN",
       doubaoEnableVad: true,
       doubaoVadStartSilenceMs: 700,
       doubaoVadEndSilenceMs: 900,
     },
     sessionId: "session-v3",
-    language: "zh",
+    language: "zh-CN",
     sampleRate: 16000,
     channels: 1,
     enablePartial: true,
@@ -265,20 +267,22 @@ test("bigmodel v3 request packet encodes official websocket payload fields", () 
   assert.deepEqual(payload.user, { uid: "session-v3" });
   assert.deepEqual(payload.audio, {
     format: "pcm",
-    sample_rate: 16000,
+    rate: 16000,
     bits: 16,
     channel: 1,
     codec: "raw",
+    language: "zh-CN",
   });
   assert.equal(payload.request.reqid, "session-v3");
   assert.equal(payload.request.model_name, "bigmodel");
+  assert.equal(payload.request.ssd_version, "200");
+  assert.equal(payload.request.enable_itn, true);
+  assert.equal(payload.request.enable_nonstream, true);
   assert.equal(payload.request.show_utterances, true);
   assert.equal(payload.request.result_type, "single");
-  assert.equal(payload.request.language, "zh");
   assert.equal(payload.request.enable_punc, true);
   assert.equal(payload.request.vad_signal, true);
-  assert.equal(payload.request.start_silence_time, 700);
-  assert.equal(payload.request.vad_silence_time, 900);
+  assert.equal(payload.request.end_window_size, 900);
 });
 
 test("audio packets round-trip through binary codec", () => {
@@ -346,6 +350,25 @@ test("bigmodel v3 object-shaped responses map to realtime events", () => {
   ]);
   assert.deepEqual(mapDoubaoResponseToRealtimeEvents(finalPacket), [
     { type: "final", text: "3123123123123。" },
+  ]);
+});
+
+test("bigmodel v3 result text without utterances maps final packet to completed text", () => {
+  const packet = decodeDoubaoPacket(
+    createDoubaoFullServerResponsePacket(
+      {
+        code: 1000,
+        result: {
+          text: "你好，小爪。",
+        },
+      },
+      { sequence: 13, flags: 3 },
+    ),
+  );
+
+  assert.deepEqual(mapDoubaoResponseToRealtimeEvents(packet), [
+    { type: "final", text: "你好，小爪。" },
+    { type: "completed", text: "你好，小爪。" },
   ]);
 });
 
@@ -500,8 +523,8 @@ test("doubao realtime transport observer receives send receive close diagnostics
       transcriptionBackend: "doubao-realtime",
       doubaoAppId: "9630954272",
       doubaoAccessToken: "token-456",
-      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
-      doubaoResourceId: "volc.bigasr.sauc.duration",
+      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
+      doubaoResourceId: "volc.seedasr.sauc.duration",
     },
     {
       WebSocket: FakeWebSocket,
@@ -558,7 +581,7 @@ test("doubao realtime transport observer receives send receive close diagnostics
       type: "open",
       event: {
         sessionId: "observer-session",
-        wsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+        wsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
         protocolMode: "bigmodel-v3",
       },
     },
@@ -653,8 +676,8 @@ test("bigmodel v3 transport sends official x-api headers", async () => {
       transcriptionBackend: "doubao-realtime",
       doubaoAppId: "9630954272",
       doubaoAccessToken: "token-456",
-      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
-      doubaoResourceId: "volc.bigasr.sauc.duration",
+      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
+      doubaoResourceId: "volc.seedasr.sauc.duration",
     },
     { WebSocket: FakeWebSocket },
   );
@@ -672,12 +695,12 @@ test("bigmodel v3 transport sends official x-api headers", async () => {
   await appendPromise;
   await connection.commit();
 
-  assert.equal(instance.url, "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel");
+  assert.equal(instance.url, "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async");
   assert.deepEqual(instance.options, {
     headers: {
       "X-Api-App-Key": "9630954272",
       "X-Api-Access-Key": "token-456",
-      "X-Api-Resource-Id": "volc.bigasr.sauc.duration",
+      "X-Api-Resource-Id": "volc.seedasr.sauc.duration",
       "X-Api-Connect-Id": "session-v3-auth",
       "X-Api-Request-Id": "session-v3-auth",
     },
@@ -720,8 +743,8 @@ test("bigmodel v3 close finish last sequence is treated as completed", async () 
       transcriptionBackend: "doubao-realtime",
       doubaoAppId: "9630954272",
       doubaoAccessToken: "token-456",
-      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
-      doubaoResourceId: "volc.bigasr.sauc.duration",
+      doubaoWsUrl: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
+      doubaoResourceId: "volc.seedasr.sauc.duration",
     },
     { WebSocket: FakeWebSocket },
   );
@@ -834,6 +857,7 @@ test("realtime session does not leave an unhandled rejection when upstream error
 
   try {
     await session.start();
+    await session.appendAudioBase64(Buffer.from("hello").toString("base64"));
     transport.connections[0].emit({
       type: "error",
       code: "upstream_bootstrap_error",
@@ -849,7 +873,8 @@ test("realtime session does not leave an unhandled rejection when upstream error
 function createDoubaoFullServerResponsePacket(payload, options = {}) {
   const body = Buffer.from(JSON.stringify(payload), "utf8");
   const hasSequence = typeof options.sequence === "number";
-  const header = Buffer.from([0x11, hasSequence ? 0x91 : 0x90, 0x11, 0x00]);
+  const flags = typeof options.flags === "number" ? options.flags : hasSequence ? 1 : 0;
+  const header = Buffer.from([0x11, 0x90 | flags, 0x11, 0x00]);
   const compressed = Buffer.from(gzipSync(body));
   if (!hasSequence) {
     const payloadSize = Buffer.alloc(4);

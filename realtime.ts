@@ -8,7 +8,11 @@ const DEFAULT_IDLE_TIMEOUT_SECONDS = 15;
 const DEFAULT_MAX_AUDIO_SECONDS = 60;
 const DOUBAO_SUCCESS_CODE = 1000;
 const DOUBAO_BIGMODEL_WS_PATH = "/api/v3/sauc/bigmodel";
+const DOUBAO_BIGMODEL_ASYNC_WS_PATH = "/api/v3/sauc/bigmodel_async";
 const DOUBAO_BIGMODEL_MODEL_NAME = "bigmodel";
+const DOUBAO_BIGMODEL_SSD_VERSION = "200";
+const DOUBAO_BIGMODEL_RESOURCE_ID = "volc.seedasr.sauc.duration";
+const DOUBAO_CLASSIC_RESOURCE_ID = "volc.bigasr.sauc.duration";
 
 const PROTOCOL_VERSION = 0x1;
 const HEADER_SIZE_UNITS = 0x1;
@@ -201,9 +205,10 @@ function isDoubaoBigmodelWsUrl(value: string): boolean {
     return false;
   }
   try {
-    return new URL(value).pathname === DOUBAO_BIGMODEL_WS_PATH;
+    const pathname = new URL(value).pathname;
+    return pathname === DOUBAO_BIGMODEL_WS_PATH || pathname === DOUBAO_BIGMODEL_ASYNC_WS_PATH;
   } catch {
-    return value.includes(DOUBAO_BIGMODEL_WS_PATH);
+    return value.includes(DOUBAO_BIGMODEL_WS_PATH) || value.includes(DOUBAO_BIGMODEL_ASYNC_WS_PATH);
   }
 }
 
@@ -226,10 +231,19 @@ function createDoubaoWebSocketHeaders(
   const appId = normalizeTrimmedString(config.doubaoAppId);
   const accessToken = normalizeTrimmedString(config.doubaoAccessToken);
   if (resolveDoubaoProtocolMode(config) === "bigmodel-v3") {
+    const resourceId = resolveDoubaoResourceId(config) || DOUBAO_BIGMODEL_RESOURCE_ID;
+    if (!appId) {
+      return {
+        "X-Api-Key": accessToken,
+        "X-Api-Resource-Id": resourceId,
+        "X-Api-Connect-Id": sessionId,
+        "X-Api-Request-Id": sessionId,
+      };
+    }
     return {
       "X-Api-App-Key": appId,
       "X-Api-Access-Key": accessToken,
-      "X-Api-Resource-Id": resolveDoubaoResourceId(config),
+      "X-Api-Resource-Id": resourceId,
       "X-Api-Connect-Id": sessionId,
       "X-Api-Request-Id": sessionId,
     };
@@ -256,11 +270,11 @@ export function isDoubaoRealtimeConfigured(config: RealtimePluginConfig): boolea
     return false;
   }
   const mode = resolveDoubaoProtocolMode(config);
+  const hasKeyOnlyAuth = mode === "bigmodel-v3" && normalizeTrimmedString(config.doubaoAccessToken);
   return Boolean(
-    normalizeTrimmedString(config.doubaoAppId) &&
-      normalizeTrimmedString(config.doubaoAccessToken) &&
+    (hasKeyOnlyAuth || (normalizeTrimmedString(config.doubaoAppId) && normalizeTrimmedString(config.doubaoAccessToken))) &&
       normalizeTrimmedString(config.doubaoWsUrl) &&
-      (mode === "bigmodel-v3" ? resolveDoubaoResourceId(config) : resolveDoubaoCluster(config)),
+      (mode === "bigmodel-v3" ? true : resolveDoubaoCluster(config)),
   );
 }
 
@@ -291,7 +305,7 @@ export function getRealtimeCapability(config: RealtimePluginConfig) {
     enabled: backend === "doubao-realtime",
     configured: isDoubaoRealtimeConfigured(config),
     wsUrl: normalizeTrimmedString(config.doubaoWsUrl),
-    cluster: resolveDoubaoCluster(config),
+    cluster: resolveDoubaoCluster(config) || DOUBAO_CLASSIC_RESOURCE_ID,
     language: normalizeTrimmedString(config.doubaoLanguage),
     chunkMs,
     enableVad: config.doubaoEnableVad !== false,
@@ -360,21 +374,23 @@ export function createDoubaoFullRequestPacket(params: {
           },
           audio: {
             format: "pcm",
-            sample_rate: params.sampleRate,
+            rate: params.sampleRate,
             bits: 16,
             channel: params.channels,
             codec: "raw",
+            language: params.language || capability.language || undefined,
           },
           request: {
             reqid: params.sessionId,
             model_name: DOUBAO_BIGMODEL_MODEL_NAME,
+            ssd_version: DOUBAO_BIGMODEL_SSD_VERSION,
+            enable_itn: true,
+            enable_nonstream: true,
             show_utterances: params.enablePartial,
             result_type: params.enablePartial ? "single" : "full",
-            language: params.language || capability.language || undefined,
             enable_punc: true,
             vad_signal: capability.enableVad,
-            start_silence_time: capability.vadStartSilenceMs,
-            vad_silence_time: capability.vadEndSilenceMs,
+            end_window_size: capability.vadEndSilenceMs,
           },
         }
       : {
@@ -536,6 +552,7 @@ function resolveDoubaoResult(payload: DoubaoResponsePayload): DoubaoResponseResu
 
 export function mapDoubaoResponseToRealtimeEvents(packet: {
   messageType: number;
+  flags: number;
   payload: Buffer;
   serialization: number;
   errorCode?: number;
@@ -580,6 +597,8 @@ export function mapDoubaoResponseToRealtimeEvents(packet: {
   const utterance = result?.utterances?.[0];
   const events: RealtimeTransportEvent[] = [];
   const sequence = typeof payload.sequence === "number" ? payload.sequence : packet.sequence ?? 0;
+  const resultText = normalizeTrimmedString(result?.text);
+  const isTerminal = sequence < 0 || (packet.flags & MESSAGE_FLAG_LAST_AUDIO) === MESSAGE_FLAG_LAST_AUDIO;
 
   if (utterance?.text) {
     if (utterance.definite) {
@@ -587,12 +606,14 @@ export function mapDoubaoResponseToRealtimeEvents(packet: {
     } else {
       events.push({ type: "partial", text: utterance.text });
     }
+  } else if (resultText) {
+    events.push({ type: isTerminal ? "final" : "partial", text: resultText });
   }
 
-  if (sequence < 0) {
+  if (isTerminal) {
     events.push({
       type: "completed",
-      text: normalizeTrimmedString(result?.text),
+      text: resultText,
     });
   }
 
@@ -896,18 +917,8 @@ export class RealtimeSession {
     if (this.started) {
       return;
     }
-    this.connection = await this.transportFactory({
-      sessionId: this.id,
-      language: this.params.language,
-      sampleRate: this.params.sampleRate,
-      channels: this.params.channels,
-      enablePartial: this.params.enablePartial !== false,
-    });
-    this.connection.setEventHandler((event) => {
-      this.touch();
-      this.handleUpstreamEvent(event);
-    });
     this.started = true;
+    this.touch();
     this.emit({ type: "session.started", sessionId: this.id });
   }
 
@@ -917,7 +928,7 @@ export class RealtimeSession {
   }
 
   async appendAudioChunk(chunk: Buffer): Promise<void> {
-    this.ensureConnection();
+    await this.ensureConnection();
     this.totalAudioBytes += chunk.length;
     this.totalAudioChunks += 1;
     this.touch();
@@ -925,7 +936,7 @@ export class RealtimeSession {
   }
 
   async commit(): Promise<string> {
-    this.ensureConnection();
+    await this.ensureConnection();
     this.touch();
     await this.connection!.commit();
     return await this.completion.promise;
@@ -958,9 +969,22 @@ export class RealtimeSession {
     this.touchedAt = Date.now();
   }
 
-  private ensureConnection(): void {
+  private async ensureConnection(): Promise<void> {
     if (!this.connection) {
-      throw new Error("Realtime session has not been started.");
+      if (!this.started) {
+        await this.start();
+      }
+      this.connection = await this.transportFactory({
+        sessionId: this.id,
+        language: this.params.language,
+        sampleRate: this.params.sampleRate,
+        channels: this.params.channels,
+        enablePartial: this.params.enablePartial !== false,
+      });
+      this.connection.setEventHandler((event) => {
+        this.touch();
+        this.handleUpstreamEvent(event);
+      });
     }
   }
 

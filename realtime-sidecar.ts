@@ -397,6 +397,10 @@ async function startSidecar(config: SidecarConfig): Promise<void> {
           sessions: manager.size,
           backend: capability.backend,
           configured: capability.configured,
+          ws_url: capability.wsUrl,
+          resource_id: config.doubaoResourceId || capability.cluster,
+          language: capability.language,
+          chunk_ms: capability.chunkMs,
           input_gain: config.inputGain ?? 1,
         });
         return;
